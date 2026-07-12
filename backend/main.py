@@ -1,0 +1,906 @@
+"""Iran Market Terminal — FastAPI backend.
+
+Run:  python3 main.py            (serves API + built frontend on :4000)
+Demo: DEMO_MODE=1 python3 main.py
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import statistics
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import uvicorn
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from app import db
+from app.auth import auth_service
+from app.aggregator import market_aggregator
+from app.alerts import alert_engine
+from app.candles import candle_service, HISTORY_WINDOWS, TF_SPEC
+from app.config import CONFIG, exchange_color, taker_fee_pct
+from app.connectors import close_client
+from app.demo_seed import seed_if_needed
+from app.intelligence import arb_ledger, inventory_requirements, tob_tracker
+from app.metrics import metrics_engine
+from app.news import news_service
+from app.premium import METHODS, premium_series
+from app.settings import settings_store
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("terminal")
+
+FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+
+
+# ------------------------------------------------------------- WebSocket ---
+
+class WSManager:
+    """Thread-safe broadcaster: alerts fire from worker threads, so sends are
+    marshalled onto the main event loop via call_soon_threadsafe."""
+
+    def __init__(self) -> None:
+        self.clients: List[WebSocket] = []
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+
+    async def connect(self, ws: WebSocket) -> None:
+        await ws.accept()
+        self.clients.append(ws)
+
+    def disconnect(self, ws: WebSocket) -> None:
+        if ws in self.clients:
+            self.clients.remove(ws)
+
+    def broadcast(self, payload: Dict[str, Any]) -> None:
+        loop = self.loop
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+        for ws in list(self.clients):
+            def _send(ws=ws):
+                asyncio.ensure_future(ws.send_json(payload))
+            try:
+                loop.call_soon_threadsafe(_send)
+            except RuntimeError:
+                pass
+
+
+ws_manager = WSManager()
+market_aggregator.add_listener(ws_manager.broadcast)
+alert_engine.add_listener(ws_manager.broadcast)
+
+
+# ------------------------------------------------------- background loops ---
+
+async def market_loop() -> None:
+    cycle = 0
+    while True:
+        try:
+            await market_aggregator.update_markets()
+            cycle += 1
+            # competitive intelligence: TOB scoreboard + opportunity ledger
+            by_asset = market_aggregator.snapshots_by_asset()
+            tob_tracker.record(by_asset)
+            await asyncio.to_thread(arb_ledger.update, market_aggregator)
+            if cycle % 5 == 0:  # evaluate alerts every ~15s
+                calendar = news_service.get_calendar()
+                await asyncio.to_thread(alert_engine.evaluate, market_aggregator, calendar)
+        except Exception as exc:
+            log.error("market loop: %s", exc)
+        await asyncio.sleep(settings_store.get().market_interval)
+
+
+async def candle_loop() -> None:
+    while True:
+        try:
+            await candle_service.refresh(market_aggregator)
+        except Exception as exc:
+            log.error("candle loop: %s", exc)
+        await asyncio.sleep(settings_store.get().candle_interval)
+
+
+async def news_loop() -> None:
+    while True:
+        try:
+            await news_service.refresh_news()
+        except Exception as exc:
+            log.error("news loop: %s", exc)
+        await asyncio.sleep(settings_store.get().news_interval)
+
+
+async def calendar_loop() -> None:
+    while True:
+        try:
+            await news_service.refresh_calendar()
+        except Exception as exc:
+            log.error("calendar loop: %s", exc)
+        # retry quickly until we have events, then settle into the normal cadence
+        if not news_service.calendar_cache:
+            await asyncio.sleep(60)
+        else:
+            await asyncio.sleep(settings_store.get().calendar_interval)
+
+
+async def prune_loop() -> None:
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            deleted = await asyncio.to_thread(db.prune, CONFIG.get("retention", {}))
+            if any(deleted.values()):
+                log.info("Pruned: %s", deleted)
+        except Exception as exc:
+            log.error("prune loop: %s", exc)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    ws_manager.loop = asyncio.get_running_loop()
+    if AUTH_ENABLED and auth_service.default_creds:
+        log.warning("Using default credentials admin/admin — change them from "
+                    "the username menu, or set AUTH_USERNAME/AUTH_PASSWORD env")
+    seed_if_needed()
+    await market_aggregator.update_markets()
+    asyncio.create_task(market_loop())
+    asyncio.create_task(candle_loop())
+    asyncio.create_task(news_loop())
+    asyncio.create_task(calendar_loop())
+    asyncio.create_task(prune_loop())
+    yield
+    await close_client()
+
+
+app = FastAPI(title="Iran Market Terminal", version="2.0.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_methods=["*"], allow_headers=["*"], allow_credentials=False,
+)
+
+AUTH_ENABLED = bool(CONFIG.get("auth_enabled", True))
+AUTH_EXEMPT = ("/api/auth/login",)
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    """Every /api route (except login) requires a valid bearer token."""
+    path = request.url.path
+    if AUTH_ENABLED and path.startswith("/api") and path not in AUTH_EXEMPT:
+        header = request.headers.get("authorization", "")
+        token = header[7:] if header.lower().startswith("bearer ") else None
+        session = auth_service.validate(token)
+        if not session:
+            return JSONResponse(status_code=401, content={"detail": "not authenticated"})
+        request.state.user = session
+    else:
+        request.state.user = None
+    return await call_next(request)
+
+
+# ----------------------------------------------------------------- guards ---
+
+def require_admin(request: Request) -> None:
+    """Mutating/config endpoints require the admin role (when auth is on)."""
+    if not AUTH_ENABLED:
+        return
+    user = getattr(request.state, "user", None)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="admin role required")
+
+
+# ----------------------------------------------------------------- models ---
+
+class SettingsUpdate(BaseModel):
+    market_interval: Optional[float] = None
+    snapshot_interval: Optional[float] = None
+    candle_interval: Optional[float] = None
+    news_interval: Optional[float] = None
+    calendar_interval: Optional[float] = None
+    request_timeout: Optional[float] = None
+    ui_refresh_interval: Optional[float] = None
+    arb_min_edge_pct: Optional[float] = None
+
+
+class AlertRuleIn(BaseModel):
+    name: str
+    rule_type: str
+    base: Optional[str] = None
+    exchange: Optional[str] = None
+    threshold: float
+    window_sec: float = 3600
+    cooldown_sec: float = 900
+
+
+class ExchangeSpecIn(BaseModel):
+    name: str
+    spec: Dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+
+
+class PairIn(BaseModel):
+    base: str
+    quote: Optional[str] = None
+    enabled: bool = True
+    coingecko_id: Optional[str] = None   # manual global-reference override
+
+
+# ------------------------------------------------------------------- auth ---
+
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/auth/login")
+def auth_login(body: LoginIn) -> Dict[str, Any]:
+    if not AUTH_ENABLED:
+        return {"token": "", "user": {"username": "anonymous", "role": "admin"}}
+    result = auth_service.login(body.username, body.password)
+    if result is None:
+        raise HTTPException(status_code=401, detail="invalid username or password")
+    if "error" in result:
+        raise HTTPException(status_code=429,
+                            detail=f"too many attempts — retry in {result['retry_in']}s")
+    return result
+
+
+@app.post("/api/auth/logout")
+def auth_logout() -> Dict[str, Any]:
+    return {"ok": True}   # stateless tokens: the client just drops its token
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request) -> Dict[str, Any]:
+    user = getattr(request.state, "user", None)
+    if not user:
+        return {"username": "anonymous", "role": "admin", "default_creds": False}
+    return {"username": user["username"], "role": "admin",
+            "default_creds": auth_service.default_creds,
+            "env_managed": auth_service.env_managed}
+
+
+# Credentials are environment-managed (AUTH_USERNAME / AUTH_PASSWORD_HASH /
+# AUTH_TOKEN_SECRET). To rotate: update the env vars and redeploy/restart.
+# Generate values:  python3 main.py hash-password "..."  |  generate-secret
+
+
+# ------------------------------------------------------------------- meta ---
+
+@app.get("/api/meta")
+def get_meta() -> Dict[str, Any]:
+    return {
+        "app": "Iran Market Terminal", "version": "2.0.0",
+        "demo_mode": bool(CONFIG.get("demo_mode")),
+        "quote_currency": CONFIG.get("quote_currency", "TMN"),
+        "exchanges": [
+            {"name": name, "enabled": bool(spec.get("enabled")),
+             "taker_fee_pct": spec.get("taker_fee_pct", 0.25),
+             "color": spec.get("color", "#8A93A6")}
+            for name, spec in CONFIG["exchanges"].items()
+        ] + [
+            {"name": row["name"], "enabled": bool(row["enabled"]),
+             "taker_fee_pct": row["spec"].get("taker_fee_pct", 0.25),
+             "color": "#8A93A6", "custom": True}
+            for row in db.get_custom_exchanges()
+        ],
+        "assets": [b for b, _q in market_aggregator.pairs()],
+        "usd_reference": market_aggregator.usd_reference,
+        "usd_reference_ts": market_aggregator.usd_reference_ts,
+        "news_refreshed_at": news_service.news_refreshed_at,
+        "calendar_refreshed_at": news_service.calendar_refreshed_at,
+        "server_time": time.time(),
+    }
+
+
+# --------------------------------------------------------------- overview ---
+
+@app.get("/api/overview")
+def get_overview() -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    by_asset = market_aggregator.snapshots_by_asset()
+    for base, quote in market_aggregator.pairs():
+        snaps = by_asset.get(base, [])
+        live = [s for s in snaps if s.mid > 0 and s.status != "offline"]
+        price = market_aggregator.composite_mid(base)
+        best_bid = max(live, key=lambda s: s.best_bid, default=None)
+        best_ask = min((s for s in live if s.best_ask > 0),
+                       key=lambda s: s.best_ask, default=None)
+        scores = metrics_engine.liquidity_scores(snaps)
+        out.append({
+            "base": base, "quote": quote,
+            "price": price,
+            "change_1h": metrics_engine.change_pct(base, quote, 3600),
+            "change_24h": metrics_engine.change_pct(base, quote, 86400),
+            "change_7d": metrics_engine.change_pct(base, quote, 7 * 86400),
+            "volume_24h_quote": sum(s.volume_24h_quote for s in live),
+            "liquidity_score": round(statistics.fmean(scores.values()), 1) if scores else None,
+            "min_spread_pct": min((s.spread_pct for s in live if s.spread_pct > 0),
+                                  default=None),
+            "best_bid": ({"exchange": best_bid.exchange, "price": best_bid.best_bid}
+                         if best_bid else None),
+            "best_ask": ({"exchange": best_ask.exchange, "price": best_ask.best_ask}
+                         if best_ask else None),
+            "premium_pct": market_aggregator.premium_pct(base),
+            "exchanges_live": len(live), "exchanges_total": len(snaps),
+            "sparkline": metrics_engine.sparkline(base),
+        })
+    # rank by 24h volume
+    out.sort(key=lambda r: r.get("volume_24h_quote") or 0, reverse=True)
+    for i, row in enumerate(out):
+        row["rank"] = i + 1
+    return out
+
+
+@app.get("/api/markets")
+def get_markets() -> List[Dict[str, Any]]:
+    return [s.to_dict() for s in market_aggregator.market_state.values()]
+
+
+@app.get("/api/pair/{base}")
+def get_pair_detail(base: str) -> Dict[str, Any]:
+    base = base.upper()
+    quote = CONFIG.get("quote_currency", "TMN")
+    snaps = [s for (ex, b), s in market_aggregator.market_state.items() if b == base]
+    if not snaps:
+        raise HTTPException(status_code=404, detail=f"unknown pair {base}")
+    scores = metrics_engine.liquidity_scores(snaps)
+    rows = []
+    for s in sorted(snaps, key=lambda x: x.exchange):
+        d = s.to_dict()
+        d["liquidity_score"] = scores.get(s.exchange)
+        d["taker_fee_pct"] = taker_fee_pct(s.exchange)
+        d["color"] = exchange_color(s.exchange)
+        d["spread_stats_1h"] = metrics_engine.spread_stats(s.exchange, base, 3600)
+        rows.append(d)
+    books = {ex: b for (ex, b_), b in market_aggregator.books.items() if b_ == base}
+    ops = metrics_engine.arbitrage(base, quote, books)
+    return {
+        "base": base, "quote": quote,
+        "price": market_aggregator.composite_mid(base),
+        "premium_pct": market_aggregator.premium_pct(base),
+        "usd_reference": market_aggregator.usd_reference.get(base),
+        "change_1h": metrics_engine.change_pct(base, quote, 3600),
+        "change_24h": metrics_engine.change_pct(base, quote, 86400),
+        "change_7d": metrics_engine.change_pct(base, quote, 7 * 86400),
+        "exchanges": rows,
+        "arbitrage": [o.to_dict() for o in ops[:10]],
+    }
+
+
+@app.get("/api/depth/{exchange}/{base}")
+def get_depth(exchange: str, base: str) -> Dict[str, Any]:
+    book = market_aggregator.books.get((exchange, base.upper()))
+    if not book:
+        raise HTTPException(status_code=404, detail="no order book")
+    return {"exchange": exchange, "base": base.upper(),
+            "bids": book.bids, "asks": book.asks, "timestamp": book.timestamp}
+
+
+# ---------------------------------------------------------------- history ---
+
+@app.get("/api/history/{base}")
+def get_history(base: str, range: str = Query("1d"),
+                exchange: Optional[str] = None) -> List[Dict[str, Any]]:
+    base = base.upper()
+    quote = CONFIG.get("quote_currency", "TMN")
+    since = time.time() - HISTORY_WINDOWS.get(range, 86400)
+    if exchange and exchange != "composite":
+        return db.get_exchange_history(exchange, base, quote, since)
+    return db.get_composite_history(base, quote, since)
+
+
+@app.get("/api/candles/{base}")
+def get_candles(base: str, tf: Optional[str] = Query(None),
+                range: Optional[str] = Query(None),      # legacy alias
+                exchange: str = Query("composite")) -> List[Dict[str, Any]]:
+    return candle_service.get(exchange, base.upper(), tf or range or "15min")
+
+
+# ----------------------------------------------------------- intelligence ---
+
+@app.get("/api/tob-share")
+def get_tob_share(base: str = Query("BTC"),
+                  range: str = Query("1d")) -> Dict[str, Any]:
+    """Top-of-book time share: % of time each venue held the best bid/ask."""
+    base = base.upper()
+    tob_tracker.flush()   # include up-to-the-minute accumulation
+    since = time.time() - HISTORY_WINDOWS.get(range, 86400)
+    rows = db.get_tob_share(base, since)
+    totals: Dict[str, Dict[str, List[float]]] = {}
+    series: Dict[str, Dict[float, Dict[str, float]]] = {}
+    for r in rows:
+        t = totals.setdefault(r["exchange"], {"bid": [0.0, 0.0], "ask": [0.0, 0.0]})
+        t[r["side"]][0] += r["seconds_best"]
+        t[r["side"]][1] += r["seconds_total"]
+        series.setdefault(r["exchange"], {}).setdefault(r["hour_ts"], {})[r["side"]] = \
+            r["seconds_best"] / r["seconds_total"] * 100 if r["seconds_total"] else 0
+    board = []
+    for ex, t in totals.items():
+        bid = t["bid"][0] / t["bid"][1] * 100 if t["bid"][1] else 0
+        ask = t["ask"][0] / t["ask"][1] * 100 if t["ask"][1] else 0
+        board.append({
+            "exchange": ex,
+            "bid_share_pct": round(bid, 2), "ask_share_pct": round(ask, 2),
+            "combined_pct": round((bid + ask) / 2, 2),
+            "series": [{"ts": h, "bid": round(v.get("bid", 0), 2),
+                        "ask": round(v.get("ask", 0), 2)}
+                       for h, v in sorted(series.get(ex, {}).items())],
+        })
+    board.sort(key=lambda r: r["combined_pct"], reverse=True)
+    for i, r in enumerate(board):
+        r["rank"] = i + 1
+    return {
+        "base": base, "range": range,
+        "current_best_bid": tob_tracker.current.get((base, "bid"), []),
+        "current_best_ask": tob_tracker.current.get((base, "ask"), []),
+        "board": board,
+    }
+
+
+@app.get("/api/market-share")
+def get_market_share(base: str = Query("ALL"),
+                     range: str = Query("1w")) -> Dict[str, Any]:
+    """Volume share per venue from persisted snapshots (reported 24h volumes)."""
+    base = base.upper()
+    quote = CONFIG.get("quote_currency", "TMN")
+    since = time.time() - HISTORY_WINDOWS.get(range, 7 * 86400)
+    bases = ([base] if base != "ALL"
+             else [b for b, _q in market_aggregator.pairs()])
+    # bucket -> exchange -> summed volume
+    buckets: Dict[float, Dict[str, float]] = {}
+    for b in bases:
+        for r in db.get_pair_snapshots(b, quote, since):
+            bts = r["ts"] - r["ts"] % 3600
+            buckets.setdefault(bts, {})
+            buckets[bts][r["exchange"]] = \
+                buckets[bts].get(r["exchange"], 0.0) + (r["volume_24h_quote"] or 0.0)
+    exchanges = sorted({ex for v in buckets.values() for ex in v})
+    series = {ex: [] for ex in exchanges}
+    for bts in sorted(buckets):
+        total = sum(buckets[bts].values())
+        for ex in exchanges:
+            share = buckets[bts].get(ex, 0.0) / total * 100 if total else 0.0
+            series[ex].append({"ts": bts, "share": round(share, 2)})
+    # current share from live state
+    live: Dict[str, float] = {}
+    for (ex, b), s in market_aggregator.market_state.items():
+        if b in bases and s.mid > 0:
+            live[ex] = live.get(ex, 0.0) + s.volume_24h_quote
+    live_total = sum(live.values())
+    current = sorted(
+        [{"exchange": ex, "share_pct": round(v / live_total * 100, 2) if live_total else 0,
+          "volume_quote": v} for ex, v in live.items()],
+        key=lambda r: r["share_pct"], reverse=True)
+    # rank movement: first vs second half of the window
+    half = since + (time.time() - since) / 2
+    def avg_share(ex, pred):
+        pts = [p["share"] for p in series.get(ex, []) if pred(p["ts"])]
+        return sum(pts) / len(pts) if pts else 0.0
+    for row in current:
+        ex = row["exchange"]
+        row["trend"] = round(avg_share(ex, lambda t: t >= half)
+                             - avg_share(ex, lambda t: t < half), 2)
+    # venues that are live but report zero volume (broken/absent ticker data),
+    # and venues whose volume is estimated from the observed trade tape
+    from app.volume_estimator import volume_estimator
+    live_venues = {ex for (ex, b), s in market_aggregator.market_state.items()
+                   if b in bases and s.mid > 0 and s.status != "offline"}
+    estimated: Dict[str, float] = {}
+    for (ex, b), s in market_aggregator.market_state.items():
+        if b in bases and s.volume_estimated:
+            _bv, _qv, cov = volume_estimator.volumes(ex, b)
+            estimated[ex] = max(estimated.get(ex, 0.0), cov)
+    not_reporting = sorted(live_venues
+                           - {r["exchange"] for r in current if r["volume_quote"] > 0}
+                           - set(estimated))
+    return {"base": base, "range": range, "current": current, "series": series,
+            "not_reporting": not_reporting, "estimated": estimated}
+
+
+@app.get("/api/opportunities/summary")
+def get_opportunities_summary(days: int = Query(7, ge=1, le=180)) -> Dict[str, Any]:
+    since = time.time() - days * 86400
+    windows = [w for w in db.get_arb_windows(since) if w["opened_ts"] >= since]
+    now = time.time()
+    day_ago = now - 86400
+    def total(rows): return round(sum(w["peak_profit_quote"] for w in rows))
+    durations = sorted((w["closed_ts"] or now) - w["opened_ts"] for w in windows)
+    by_hour = [0.0] * 24
+    by_route: Dict[str, Dict[str, Any]] = {}
+    from datetime import datetime, timezone, timedelta
+    tehran = timezone(timedelta(hours=3, minutes=30))
+    for w in windows:
+        hour = datetime.fromtimestamp(w["opened_ts"], tehran).hour
+        by_hour[hour] += w["peak_profit_quote"]
+        route = f"{w['base']}: {w['buy_exchange']}→{w['sell_exchange']}"
+        r = by_route.setdefault(route, {"route": route, "count": 0, "profit": 0.0})
+        r["count"] += 1
+        r["profit"] = round(r["profit"] + w["peak_profit_quote"])
+    return {
+        "days": days,
+        "open_now": sum(1 for w in windows if w["closed_ts"] is None),
+        "windows_total": len(windows),
+        "missed_profit_quote": total(windows),
+        "missed_profit_24h": total([w for w in windows if w["opened_ts"] >= day_ago]),
+        "median_duration_sec": round(durations[len(durations) // 2], 1) if durations else None,
+        "by_hour": [round(v) for v in by_hour],
+        "top_routes": sorted(by_route.values(), key=lambda r: r["profit"], reverse=True)[:8],
+        "min_edge_pct": settings_store.get().arb_min_edge_pct,
+    }
+
+
+@app.get("/api/opportunities/windows")
+def get_opportunities_windows(days: int = Query(7, ge=1, le=180),
+                              limit: int = Query(100, ge=1, le=1000)) -> List[Dict[str, Any]]:
+    since = time.time() - days * 86400
+    return db.get_arb_windows(since, limit)
+
+
+@app.get("/api/opportunities/inventory")
+def get_opportunities_inventory(days: int = Query(7, ge=1, le=180)) -> Dict[str, Any]:
+    """Minimum per-venue balances (TMN + coins) to capture 100% / 95% of the
+    period's windows without any transfers."""
+    since = time.time() - days * 86400
+    windows = [w for w in db.get_arb_windows(since, limit=10000)
+               if w["opened_ts"] >= since]
+    result = inventory_requirements(windows)
+    result["days"] = days
+    return result
+
+
+# ---------------------------------------------------------------- premium ---
+
+@app.get("/api/premium/methods")
+def get_premium_methods() -> Dict[str, Any]:
+    return {
+        "methods": list(METHODS),
+        "exchanges": sorted({ex for (ex, _b) in market_aggregator.market_state}),
+        "assets": [b for b, _q in market_aggregator.pairs() if b != "USDT"],
+    }
+
+
+@app.get("/api/premium/{base}")
+def get_premium(base: str, range: str = Query("1d"),
+                method: str = Query("composite"),
+                exchange: Optional[str] = None) -> Dict[str, Any]:
+    base = base.upper()
+    if base == "USDT":
+        raise HTTPException(status_code=422,
+                            detail="USDT is the local benchmark — no premium")
+    if method not in METHODS:
+        raise HTTPException(status_code=422, detail=f"method must be one of {METHODS}")
+    if method == "exchange" and not exchange:
+        raise HTTPException(status_code=422, detail="method=exchange requires ?exchange=")
+    quote = CONFIG.get("quote_currency", "TMN")
+    since = time.time() - HISTORY_WINDOWS.get(range, 86400)
+    series = premium_series(base, quote, method, since, exchange)
+    values = [p["premium_pct"] for p in series]
+    return {
+        "base": base, "quote": quote, "method": method, "exchange": exchange,
+        "range": range,
+        "current": market_aggregator.premium_pct(base, method, exchange),
+        "usd_reference": market_aggregator.usd_reference.get(base),
+        "stats": {
+            "avg": round(statistics.fmean(values), 3) if values else None,
+            "min": round(min(values), 3) if values else None,
+            "max": round(max(values), 3) if values else None,
+            "stdev": round(statistics.pstdev(values), 3) if len(values) > 1 else None,
+        },
+        "series": series,
+    }
+
+
+# -------------------------------------------------------------- analytics ---
+
+@app.get("/api/analytics/spread/{base}")
+def get_spread_analytics(base: str, window: int = Query(3600, ge=300, le=30 * 86400),
+                         exchange: Optional[str] = None) -> Dict[str, Any]:
+    base = base.upper()
+    quote = CONFIG.get("quote_currency", "TMN")
+    exchanges = ([exchange] if exchange else
+                 sorted({ex for (ex, b) in market_aggregator.market_state if b == base}))
+    stats = {ex: metrics_engine.spread_stats(ex, base, window) for ex in exchanges}
+    history = db.get_spread_history(base, quote, time.time() - window, exchange)
+    return {"base": base, "window_sec": window, "stats": stats, "history": history}
+
+
+@app.get("/api/arbitrage")
+def get_arbitrage() -> List[Dict[str, Any]]:
+    out = []
+    for base, quote in market_aggregator.pairs():
+        books = {ex: b for (ex, b_), b in market_aggregator.books.items() if b_ == base}
+        out.extend(o.to_dict() for o in metrics_engine.arbitrage(base, quote, books))
+    out.sort(key=lambda o: o["net_pct"], reverse=True)
+    return out
+
+
+@app.get("/api/anomalies")
+def get_anomalies() -> List[Dict[str, Any]]:
+    out = [a.to_dict() for a in
+           metrics_engine.detect_anomalies(market_aggregator.snapshots_by_asset())]
+    # actionable arbitrage windows surface here too (info severity)
+    now = time.time()
+    for base, quote in market_aggregator.pairs():
+        books = {ex: b for (ex, b_), b in market_aggregator.books.items() if b_ == base}
+        for o in metrics_engine.arbitrage(base, quote, books)[:2]:
+            if o.net_pct >= 0.25:
+                out.append({
+                    "kind": "arbitrage", "exchange": f"{o.buy_exchange}→{o.sell_exchange}",
+                    "base": base, "severity": "info", "value": o.net_pct,
+                    "message": (f"{base}: buy {o.buy_exchange} / sell {o.sell_exchange} "
+                                f"nets {o.net_pct:.2f}% after fees "
+                                f"(size {o.max_size_base:g} {base})"),
+                    "timestamp": now,
+                })
+    sev_rank = {"critical": 0, "warning": 1, "info": 2}
+    out.sort(key=lambda a: (sev_rank.get(a["severity"], 3), -abs(a.get("value", 0))))
+    return out
+
+
+# Standard clip sizes for the large-order impact simulation, in quote (TMN)
+IMPACT_CLIP_QUOTE = 2_000_000_000   # ~2B TMN market order
+
+
+@app.get("/api/impact/{base}")
+def get_impact(base: str, notional: float = Query(2e9, gt=0, le=1e15)) -> List[Dict[str, Any]]:
+    """Slippage calculator: cost of a market order of `notional` TMN on every
+    venue, both directions, walked through the live order books."""
+    base = base.upper()
+    rows = []
+    for (ex, b), book in market_aggregator.books.items():
+        if b != base or not book.bids or not book.asks:
+            continue
+        mid = (book.best_bid + book.best_ask) / 2
+        buy = metrics_engine.order_impact_pct(book, notional, "buy")
+        sell = metrics_engine.order_impact_pct(book, notional, "sell")
+        rows.append({
+            "exchange": ex, "base": base, "mid": mid,
+            "buy_impact_pct": buy,
+            "sell_impact_pct": sell,
+            "buy_price": round(mid * (1 + buy / 100), 2) if buy is not None else None,
+            "sell_price": round(mid * (1 - sell / 100), 2) if sell is not None else None,
+        })
+    rows.sort(key=lambda r: r["buy_impact_pct"] if r["buy_impact_pct"] is not None else 1e9)
+    return rows
+
+
+@app.get("/api/liquidity")
+def get_liquidity() -> List[Dict[str, Any]]:
+    """Per venue x asset liquidity board with real-time warnings:
+    spread vs its 1h average, top-20 depth, depth drop, liquidity score,
+    and simulated slippage of a large market order."""
+    rows: List[Dict[str, Any]] = []
+    by_asset = market_aggregator.snapshots_by_asset()
+    for base, snaps in by_asset.items():
+        scores = metrics_engine.liquidity_scores(snaps)
+        for s in snaps:
+            if s.mid <= 0:
+                continue
+            book = market_aggregator.books.get((s.exchange, base))
+            impact = (metrics_engine.order_impact_pct(book, IMPACT_CLIP_QUOTE)
+                      if book else None)
+            st = metrics_engine.spread_stats(s.exchange, base, 3600)
+            drop = metrics_engine.depth_drop_pct(s.exchange, base)
+            score = scores.get(s.exchange)
+            warnings: List[str] = []
+            if s.status == "offline":
+                warnings.append("offline")
+            if score is not None and score < 40:
+                warnings.append("low_score")
+            if st["avg"] and st["current"] and st["current"] >= 2 * st["avg"]:
+                warnings.append("spread_widening")
+            if drop is not None and drop >= 30:
+                warnings.append("depth_drop")
+            if impact is None:
+                warnings.append("book_too_thin")
+            elif impact >= 0.5:
+                warnings.append("high_impact")
+            rows.append({
+                "exchange": s.exchange, "base": base,
+                "status": s.status,
+                "liquidity_score": score,
+                "spread_pct": round(s.spread_pct, 4),
+                "spread_avg_1h": st["avg"],
+                "bid_depth_quote": s.bid_depth_quote,
+                "ask_depth_quote": s.ask_depth_quote,
+                "depth_imbalance": round(s.depth_imbalance, 4),
+                "depth_drop_pct": drop,
+                "impact_pct": impact,
+                "impact_clip_quote": IMPACT_CLIP_QUOTE,
+                "warnings": warnings,
+            })
+    rows.sort(key=lambda r: (-len(r["warnings"]), r["liquidity_score"] or 0))
+    return rows
+
+
+# ----------------------------------------------------------------- alerts ---
+
+@app.get("/api/alerts/rules")
+def list_alert_rules() -> List[Dict[str, Any]]:
+    return db.get_alert_rules()
+
+
+@app.post("/api/alerts/rules", dependencies=[Depends(require_admin)])
+def create_alert_rule(rule: AlertRuleIn) -> Dict[str, Any]:
+    rule_id = db.insert_alert_rule(rule.name, rule.rule_type, rule.base,
+                                   rule.exchange, rule.threshold,
+                                   rule.window_sec, rule.cooldown_sec)
+    return {"id": rule_id}
+
+
+@app.delete("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_admin)])
+def remove_alert_rule(rule_id: int) -> Dict[str, Any]:
+    db.delete_alert_rule(rule_id)
+    return {"ok": True}
+
+
+@app.patch("/api/alerts/rules/{rule_id}", dependencies=[Depends(require_admin)])
+def toggle_alert_rule(rule_id: int, enabled: bool = Query(...)) -> Dict[str, Any]:
+    db.set_alert_rule_enabled(rule_id, enabled)
+    return {"ok": True}
+
+
+@app.get("/api/alerts/events")
+def list_alert_events(hours: int = Query(24, ge=1, le=720)) -> List[Dict[str, Any]]:
+    return db.get_alert_events(time.time() - hours * 3600)
+
+
+@app.post("/api/alerts/events/{event_id}/ack")
+def ack_alert(event_id: int) -> Dict[str, Any]:
+    db.ack_alert_event(event_id)
+    return {"ok": True}
+
+
+# --------------------------------------------------------- calendar / news --
+
+@app.get("/api/calendar")
+def get_calendar(impact: str = "ALL", country: str = "ALL") -> List[Dict[str, Any]]:
+    return news_service.get_calendar(impact, country)
+
+
+@app.get("/api/calendar/history")
+def get_calendar_history(title: str, country: str) -> List[Dict[str, Any]]:
+    return db.get_event_surprise_history(title, country)
+
+
+@app.get("/api/news")
+def get_news(coin: str = "ALL", min_impact: int = Query(1, ge=1, le=3)) -> List[Dict[str, Any]]:
+    return news_service.get_news(coin, min_impact)
+
+
+# --------------------------------------------------------------- settings ---
+
+@app.get("/api/settings")
+def get_settings() -> Dict[str, Any]:
+    from dataclasses import asdict
+    return asdict(settings_store.get())
+
+
+@app.post("/api/settings", dependencies=[Depends(require_admin)])
+def update_settings(update: SettingsUpdate) -> Dict[str, Any]:
+    from dataclasses import asdict
+    return asdict(settings_store.update(update.model_dump(exclude_none=True)))
+
+
+# ------------------------------------------------------------------ admin ---
+
+@app.get("/api/admin/exchanges")
+def list_custom_exchanges() -> List[Dict[str, Any]]:
+    return db.get_custom_exchanges()
+
+
+@app.post("/api/admin/exchanges", dependencies=[Depends(require_admin)])
+def add_custom_exchange(body: ExchangeSpecIn) -> Dict[str, Any]:
+    spec = dict(body.spec)
+    spec.setdefault("name", body.name)
+    if "orderbook_url" not in spec:
+        raise HTTPException(status_code=422, detail="spec.orderbook_url is required")
+    db.upsert_custom_exchange(body.name, spec, body.enabled)
+    market_aggregator.reload_connectors()
+    return {"ok": True, "active": [c.exchange_name for c in market_aggregator.connectors]}
+
+
+@app.delete("/api/admin/exchanges/{name}", dependencies=[Depends(require_admin)])
+def remove_custom_exchange(name: str) -> Dict[str, Any]:
+    db.delete_custom_exchange(name)
+    market_aggregator.reload_connectors()
+    return {"ok": True}
+
+
+@app.get("/api/admin/pairs")
+def list_custom_pairs() -> List[Dict[str, Any]]:
+    return db.get_custom_pairs()
+
+
+@app.post("/api/admin/pairs", dependencies=[Depends(require_admin)])
+def add_custom_pair(body: PairIn) -> Dict[str, Any]:
+    quote = body.quote or CONFIG.get("quote_currency", "TMN")
+    db.upsert_custom_pair(body.base, quote, body.enabled)
+    if body.coingecko_id:
+        db.upsert_reference_id(body.base, body.coingecko_id.strip().lower())
+        market_aggregator._reference.set_id(body.base, body.coingecko_id.strip().lower())
+    market_aggregator._unresolvable.discard(body.base.upper())
+    market_aggregator.usd_reference_ts = 0.0   # refresh reference on next cycle
+    return {"ok": True, "pairs": [f"{b}/{q}" for b, q in market_aggregator.pairs()]}
+
+
+@app.delete("/api/admin/pairs/{base}", dependencies=[Depends(require_admin)])
+def remove_custom_pair(base: str) -> Dict[str, Any]:
+    db.delete_custom_pair(base, CONFIG.get("quote_currency", "TMN"))
+    return {"ok": True}
+
+
+# -------------------------------------------------------------- WebSocket ---
+
+@app.websocket("/ws")
+async def websocket_endpoint(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
+    if AUTH_ENABLED and not auth_service.validate(token):
+        await ws.close(code=4401)
+        return
+    await ws_manager.connect(ws)
+    try:
+        while True:
+            await ws.receive_text()  # keepalive pings from client
+    except WebSocketDisconnect:
+        ws_manager.disconnect(ws)
+    except Exception:
+        ws_manager.disconnect(ws)
+
+
+# ----------------------------------------------------------------- static ---
+
+if FRONTEND_DIST.exists():
+    app.mount("/", StaticFiles(directory=FRONTEND_DIST, html=True), name="frontend")
+else:
+    log.warning("frontend/dist not found — build it with: cd frontend && npm run build")
+
+
+def _cli(args: List[str]) -> int:
+    """Offline credential management (single-user auth).
+
+    python3 main.py hash-password "<password>"   print AUTH_PASSWORD_HASH value
+    python3 main.py generate-secret              print AUTH_TOKEN_SECRET value
+    python3 main.py whoami                       show active username
+    """
+    cmd = args[0]
+    if cmd == "hash-password" and len(args) >= 2:
+        from app.auth import hash_password
+        if len(args[1]) < 6:
+            print("password must be at least 6 characters")
+            return 1
+        print("AUTH_PASSWORD_HASH=" + hash_password(args[1]))
+        print("\n→ copy this line into backend/.env (local) or add the variable"
+              "\n  in your hosting dashboard (Vercel → Settings → Environment"
+              "\n  Variables), then restart/redeploy.")
+        return 0
+    if cmd == "generate-secret":
+        from app.auth import generate_secret
+        print("AUTH_TOKEN_SECRET=" + generate_secret())
+        print("\n→ set alongside AUTH_PASSWORD_HASH; rotating it logs everyone out.")
+        return 0
+    if cmd == "whoami":
+        suffix = " (default admin/admin — configure env!)" \
+            if auth_service.default_creds else ""
+        print(auth_service.username + suffix)
+        return 0
+    print(_cli.__doc__)
+    return 1
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1:
+        raise SystemExit(_cli(sys.argv[1:]))
+    server = CONFIG.get("server", {})
+    uvicorn.run(app, host=server.get("host", "127.0.0.1"),
+                port=int(server.get("port", 4000)))

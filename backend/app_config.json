@@ -1,0 +1,28 @@
+{
+  "quote_currency": "TMN",
+  "assets": ["BTC", "ETH", "USDT"],
+  "exchanges": {
+    "Nobitex":  { "enabled": true,  "taker_fee_pct": 0.25, "color": "#4A9EFF" },
+    "Wallex":   { "enabled": true,  "taker_fee_pct": 0.25, "color": "#9C6BFF" },
+    "Bitpin":   { "enabled": true,  "taker_fee_pct": 0.30, "color": "#00D68F" },
+    "Exir":     { "enabled": true,  "taker_fee_pct": 0.20, "color": "#FFB020" },
+    "Tabdeal":  { "enabled": true,  "taker_fee_pct": 0.25, "color": "#FF6B9D" },
+    "Ramzinex": { "enabled": true,  "taker_fee_pct": 0.35, "color": "#38C6D9" }
+  },
+  "reference": {
+    "enabled": true,
+    "provider": "coingecko",
+    "coingecko_ids": { "BTC": "bitcoin", "ETH": "ethereum", "USDT": "tether" }
+  },
+  "retention": {
+    "snapshots_days": 90,
+    "candles_days": 365,
+    "alerts_days": 30,
+    "calendar_days": 730
+  },
+  "depth_levels": 20,
+  "demo_mode": false,
+  "admin_token": "",
+  "auth_enabled": true,
+  "server": { "host": "127.0.0.1", "port": 4000 }
+}
