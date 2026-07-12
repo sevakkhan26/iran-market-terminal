@@ -17,9 +17,30 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-DATA_DIR = Path(os.environ.get("TERMINAL_DATA_DIR")
-                or Path(__file__).resolve().parent.parent / "data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+def _resolve_data_dir() -> Path:
+    """Preferred data dir, falling back to a temp dir on read-only hosting
+    (Vercel & other serverless platforms) so imports never crash."""
+    preferred = Path(os.environ.get("TERMINAL_DATA_DIR")
+                     or Path(__file__).resolve().parent.parent / "data")
+    try:
+        preferred.mkdir(parents=True, exist_ok=True)
+        probe = preferred / ".write-probe"
+        probe.write_text("ok")           # some platforms allow mkdir but not write
+        probe.unlink()
+        return preferred
+    except OSError:
+        import logging
+        import tempfile
+        fallback = Path(tempfile.gettempdir()) / "terminal-data"
+        fallback.mkdir(parents=True, exist_ok=True)
+        logging.getLogger("terminal.db").warning(
+            "%s is not writable — using %s (ephemeral). History will not "
+            "persist; run on a server with a writable disk for full features.",
+            preferred, fallback)
+        return fallback
+
+
+DATA_DIR = _resolve_data_dir()
 DB_PATH = DATA_DIR / "terminal.db"
 
 _lock = threading.Lock()

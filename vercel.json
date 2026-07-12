@@ -2,7 +2,10 @@
   "builds": [
     {
       "src": "backend/api/index.py",
-      "use": "@vercel/python"
+      "use": "@vercel/python",
+      "config": {
+        "includeFiles": "backend/**"
+      }
     },
     {
       "src": "frontend/package.json",
@@ -18,8 +21,12 @@
       "dest": "backend/api/index.py"
     },
     {
-      "src": "/(.*)",
+      "src": "/(.*\\..+)",
       "dest": "frontend/$1"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "frontend/index.html"
     }
   ]
 }

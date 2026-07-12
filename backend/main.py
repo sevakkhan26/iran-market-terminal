@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import statistics
 import time
 from contextlib import asynccontextmanager
@@ -142,21 +143,40 @@ async def prune_loop() -> None:
             log.error("prune loop: %s", exc)
 
 
+# Serverless platforms (Vercel sets VERCEL=1; api/index.py sets SERVERLESS=1)
+# can't host background loops — requests are short-lived. The API still works
+# (auth, static UI, whatever data a warm instance manages to fetch), but for
+# continuous collection run `python3 main.py` on a real server.
+IS_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("SERVERLESS"))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ws_manager.loop = asyncio.get_running_loop()
     if AUTH_ENABLED and auth_service.default_creds:
-        log.warning("Using default credentials admin/admin — change them from "
-                    "the username menu, or set AUTH_USERNAME/AUTH_PASSWORD env")
+        log.warning("Using default credentials admin/admin — set AUTH_USERNAME/"
+                    "AUTH_PASSWORD_HASH/AUTH_TOKEN_SECRET env variables")
     seed_if_needed()
-    await market_aggregator.update_markets()
-    asyncio.create_task(market_loop())
-    asyncio.create_task(candle_loop())
-    asyncio.create_task(news_loop())
-    asyncio.create_task(calendar_loop())
-    asyncio.create_task(prune_loop())
+    if IS_SERVERLESS:
+        log.warning("Serverless mode: background polling loops disabled")
+        asyncio.create_task(_safe_first_poll())   # best-effort, non-blocking
+    else:
+        await market_aggregator.update_markets()
+        asyncio.create_task(market_loop())
+        asyncio.create_task(candle_loop())
+        asyncio.create_task(news_loop())
+        asyncio.create_task(calendar_loop())
+        asyncio.create_task(prune_loop())
     yield
     await close_client()
+
+
+async def _safe_first_poll() -> None:
+    try:
+        await market_aggregator.update_markets()
+        await news_service.refresh_calendar()
+    except Exception as exc:
+        log.warning("serverless first poll failed: %s", exc)
 
 
 app = FastAPI(title="Iran Market Terminal", version="2.0.0", lifespan=lifespan)
