@@ -30,21 +30,59 @@ HEADERS = {
     "Accept": "application/json",
 }
 
+# Bounded pool + a hard cap on the client's lifetime. On a server with a
+# flaky/slow route to the exchanges, every request that asyncio.wait_for cancels
+# on timeout can leak a pooled connection; with httpx's default (unbounded-ish)
+# pool that leak accumulates until the pool is exhausted and *every* subsequent
+# request stalls waiting for a free slot — the exact "works on my PC, dies after
+# ~10 min on the server, nothing in the logs" failure. We cap the pool AND
+# recycle the whole client every few minutes so any leak is periodically shed.
+_LIMITS = httpx.Limits(max_connections=40, max_keepalive_connections=10,
+                       keepalive_expiry=30.0)
+_CLIENT_MAX_AGE = 300.0        # rebuild the shared client every 5 minutes
+
 _client: Optional[httpx.AsyncClient] = None
+_client_ts: float = 0.0
 
 
 def get_client(timeout: float = 6.0) -> httpx.AsyncClient:
-    global _client
+    global _client, _client_ts
     if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(timeout=timeout, headers=HEADERS,
-                                    follow_redirects=True)
+        _client = httpx.AsyncClient(timeout=httpx.Timeout(timeout), headers=HEADERS,
+                                    follow_redirects=True, limits=_LIMITS)
+        _client_ts = time.time()
     return _client
+
+
+def maybe_recycle_client() -> None:
+    """Drop and rebuild the shared client once it ages out, releasing any
+    connections leaked by cancelled requests. Call BETWEEN cycles only — never
+    while requests on the current client are still in flight in this task."""
+    global _client, _client_ts
+    if _client is None or _client.is_closed:
+        return
+    if time.time() - _client_ts <= _CLIENT_MAX_AGE:
+        return
+    old, _client = _client, None           # next get_client() builds a fresh one
+    try:
+        asyncio.get_running_loop().create_task(_aclose_later(old))
+    except RuntimeError:
+        pass
+
+
+async def _aclose_later(client: httpx.AsyncClient, delay: float = 10.0) -> None:
+    try:
+        await asyncio.sleep(delay)         # let in-flight requests drain first
+        await client.aclose()
+    except Exception:
+        pass
 
 
 async def close_client() -> None:
     global _client
     if _client is not None and not _client.is_closed:
         await _client.aclose()
+    _client = None
 
 
 def first_positive(item: Dict[str, Any], keys: tuple) -> float:

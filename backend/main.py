@@ -69,7 +69,12 @@ class WSManager:
                 return
         for ws in list(self.clients):
             def _send(ws=ws):
-                asyncio.ensure_future(ws.send_json(payload))
+                async def _deliver():
+                    try:
+                        await ws.send_json(payload)
+                    except Exception:
+                        self.disconnect(ws)   # drop dead clients so the list can't grow
+                asyncio.ensure_future(_deliver())
             try:
                 loop.call_soon_threadsafe(_send)
             except RuntimeError:
@@ -82,65 +87,124 @@ alert_engine.add_listener(ws_manager.broadcast)
 
 
 # ------------------------------------------------------- background loops ---
+#
+# Every background loop runs through _run_loop, which fixes the class of bug
+# where a single stuck network/DB call silently freezes collection forever
+# ("UI is up but no new data, nothing in the logs"). It guarantees:
+#   1. No cycle can hang — each is bounded by asyncio.wait_for, so a stuck call
+#      aborts the cycle (logged loudly) instead of freezing the whole loop.
+#   2. Health is observable — last-success time per loop, surfaced on /api/meta
+#      and in a periodic heartbeat log line (+ a watchdog warning on stalls).
+#   3. A loop that somehow exits is automatically restarted (see _spawn_loop).
 
-async def market_loop() -> None:
+# loop name -> health counters (seconds / counts)
+LOOP_HEALTH: Dict[str, Dict[str, float]] = {}
+_loop_tasks: Dict[str, asyncio.Task] = {}
+_shutting_down = False
+
+
+async def _run_loop(name: str, work, interval_getter, work_timeout: float) -> None:
+    health = LOOP_HEALTH.setdefault(
+        name, {"last_success": 0.0, "last_attempt": 0.0, "timeouts": 0.0, "fails": 0.0})
     cycle = 0
     while True:
+        health["last_attempt"] = time.time()
         try:
-            await market_aggregator.update_markets()
+            await asyncio.wait_for(work(cycle), timeout=work_timeout)
+            health["last_success"] = time.time()
+            health["fails"] = 0.0
             cycle += 1
-            # competitive intelligence: TOB scoreboard + opportunity ledger
-            by_asset = market_aggregator.snapshots_by_asset()
-            tob_tracker.record(by_asset)
-            await asyncio.to_thread(arb_ledger.update, market_aggregator)
-            if cycle % 5 == 0:  # evaluate alerts every ~15s
-                calendar = news_service.get_calendar()
-                await asyncio.to_thread(alert_engine.evaluate, market_aggregator, calendar)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            health["timeouts"] += 1
+            health["fails"] += 1
+            log.error("%s loop: cycle exceeded %.0fs and was aborted — a network "
+                      "or DB call is stuck; recovering and continuing "
+                      "(timeouts=%d)", name, work_timeout, int(health["timeouts"]))
         except Exception as exc:
-            log.error("market loop: %s", exc)
-        await asyncio.sleep(settings_store.get().market_interval)
+            health["fails"] += 1
+            log.exception("%s loop error: %s", name, exc)
+        try:
+            await asyncio.sleep(max(0.5, interval_getter()))
+        except asyncio.CancelledError:
+            raise
 
 
-async def candle_loop() -> None:
+def _spawn_loop(name: str, work, interval_getter, work_timeout: float) -> None:
+    """Start a supervised loop; if it ever exits unexpectedly, restart it."""
+    task = asyncio.create_task(
+        _run_loop(name, work, interval_getter, work_timeout), name=f"loop:{name}")
+    _loop_tasks[name] = task
+
+    def _on_done(t: asyncio.Task) -> None:
+        if t.cancelled() or _shutting_down:
+            return
+        exc = t.exception()
+        log.error("loop %s exited unexpectedly (%s) — restarting in 2s", name, exc)
+        try:
+            asyncio.get_running_loop().call_later(
+                2.0, lambda: _spawn_loop(name, work, interval_getter, work_timeout))
+        except RuntimeError:
+            pass
+
+    task.add_done_callback(_on_done)
+
+
+# ---- per-loop work bodies (one cycle each) --------------------------------
+
+async def _market_work(cycle: int) -> None:
+    await market_aggregator.update_markets()
+    # competitive intelligence: TOB scoreboard + opportunity ledger
+    tob_tracker.record(market_aggregator.snapshots_by_asset())
+    await asyncio.wait_for(
+        asyncio.to_thread(arb_ledger.update, market_aggregator), timeout=20)
+    if cycle % 5 == 0:  # evaluate alerts every ~5 cycles
+        calendar = news_service.get_calendar()
+        await asyncio.wait_for(
+            asyncio.to_thread(alert_engine.evaluate, market_aggregator, calendar),
+            timeout=20)
+
+
+async def _candle_work(_cycle: int) -> None:
+    await candle_service.refresh(market_aggregator)
+
+
+async def _news_work(_cycle: int) -> None:
+    await news_service.refresh_news()
+
+
+async def _calendar_work(_cycle: int) -> None:
+    await news_service.refresh_calendar()
+
+
+async def _prune_work(_cycle: int) -> None:
+    deleted = await asyncio.wait_for(
+        asyncio.to_thread(db.prune, CONFIG.get("retention", {})), timeout=45)
+    if any(deleted.values()):
+        log.info("Pruned: %s", deleted)
+
+
+async def _heartbeat_loop() -> None:
+    """Periodic health line + stall warning, so a frozen loop is never silent."""
     while True:
         try:
-            await candle_service.refresh(market_aggregator)
-        except Exception as exc:
-            log.error("candle loop: %s", exc)
-        await asyncio.sleep(settings_store.get().candle_interval)
-
-
-async def news_loop() -> None:
-    while True:
-        try:
-            await news_service.refresh_news()
-        except Exception as exc:
-            log.error("news loop: %s", exc)
-        await asyncio.sleep(settings_store.get().news_interval)
-
-
-async def calendar_loop() -> None:
-    while True:
-        try:
-            await news_service.refresh_calendar()
-        except Exception as exc:
-            log.error("calendar loop: %s", exc)
-        # retry quickly until we have events, then settle into the normal cadence
-        if not news_service.calendar_cache:
             await asyncio.sleep(60)
-        else:
-            await asyncio.sleep(settings_store.get().calendar_interval)
-
-
-async def prune_loop() -> None:
-    while True:
-        await asyncio.sleep(3600)
-        try:
-            deleted = await asyncio.to_thread(db.prune, CONFIG.get("retention", {}))
-            if any(deleted.values()):
-                log.info("Pruned: %s", deleted)
-        except Exception as exc:
-            log.error("prune loop: %s", exc)
+            now = time.time()
+            parts = []
+            for nm, h in LOOP_HEALTH.items():
+                age = now - h["last_success"] if h["last_success"] else None
+                parts.append(f"{nm}={('%.0fs' % age) if age is not None else 'never'}")
+            log.info("heartbeat — last update: %s", ", ".join(parts))
+            mh = LOOP_HEALTH.get("market", {})
+            if mh.get("last_success") and now - mh["last_success"] > 120:
+                log.error("WATCHDOG: market data has not updated in %.0fs — the "
+                          "poll loop is stalling; check exchange connectivity "
+                          "from this host", now - mh["last_success"])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            pass
 
 
 # Serverless platforms (Vercel sets VERCEL=1; api/index.py sets SERVERLESS=1)
@@ -152,6 +216,8 @@ IS_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("SERVERLESS"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _shutting_down
+    _shutting_down = False
     ws_manager.loop = asyncio.get_running_loop()
     if AUTH_ENABLED and auth_service.default_creds:
         log.warning("Using default credentials admin/admin — set AUTH_USERNAME/"
@@ -161,13 +227,26 @@ async def lifespan(app: FastAPI):
         log.warning("Serverless mode: background polling loops disabled")
         asyncio.create_task(_safe_first_poll())   # best-effort, non-blocking
     else:
-        await market_aggregator.update_markets()
-        asyncio.create_task(market_loop())
-        asyncio.create_task(candle_loop())
-        asyncio.create_task(news_loop())
-        asyncio.create_task(calendar_loop())
-        asyncio.create_task(prune_loop())
+        try:  # prime state once so the first requests aren't empty (bounded)
+            await asyncio.wait_for(market_aggregator.update_markets(), timeout=40)
+        except Exception as exc:
+            log.warning("initial market poll failed (will retry in loop): %s", exc)
+        _spawn_loop("market", _market_work,
+                    lambda: settings_store.get().market_interval, 40)
+        _spawn_loop("candle", _candle_work,
+                    lambda: settings_store.get().candle_interval, 60)
+        _spawn_loop("news", _news_work,
+                    lambda: settings_store.get().news_interval, 60)
+        _spawn_loop("calendar", _calendar_work,
+                    lambda: (60 if not news_service.calendar_cache
+                             else settings_store.get().calendar_interval), 60)
+        _spawn_loop("prune", _prune_work, lambda: 3600.0, 60)
+        _loop_tasks["heartbeat"] = asyncio.create_task(
+            _heartbeat_loop(), name="loop:heartbeat")
     yield
+    _shutting_down = True
+    for t in _loop_tasks.values():
+        t.cancel()
     await close_client()
 
 
@@ -319,6 +398,13 @@ def get_meta() -> Dict[str, Any]:
         "news_refreshed_at": news_service.news_refreshed_at,
         "calendar_refreshed_at": news_service.calendar_refreshed_at,
         "server_time": time.time(),
+        "loops": {
+            nm: {
+                "last_update_age": (round(time.time() - h["last_success"], 1)
+                                    if h["last_success"] else None),
+                "timeouts": int(h["timeouts"]),
+            } for nm, h in LOOP_HEALTH.items()
+        },
     }
 
 

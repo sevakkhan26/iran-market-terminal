@@ -53,6 +53,11 @@ def _connect() -> sqlite3.Connection:
         _conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         _conn.execute("PRAGMA journal_mode=WAL")
         _conn.execute("PRAGMA synchronous=NORMAL")
+        # Bound any internal SQLite lock wait to 5s so a contended DB (another
+        # process holding the WAL lock, a slow disk) raises instead of blocking
+        # a worker thread forever — an unbounded block there can freeze the
+        # background loops that offload writes to threads.
+        _conn.execute("PRAGMA busy_timeout=5000")
         _conn.row_factory = sqlite3.Row
     return _conn
 

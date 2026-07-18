@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from . import db
 from .config import CONFIG
 from .connectors import (BaseExchangeConnector, DemoConnector, ReferenceConnector,
-                         build_connectors)
+                         build_connectors, maybe_recycle_client)
 from .metrics import metrics_engine
 from .models import MarketSnapshot, MarketStatus, OrderBook, TickerStats
 from .settings import settings_store
@@ -66,6 +66,7 @@ class MarketAggregator:
 
     # -------------------------------------------------------------- cycle --
     async def update_markets(self) -> None:
+        maybe_recycle_client()   # shed any leaked pooled connections between cycles
         settings = settings_store.get()
         pairs = self.pairs()
         refresh_stats = time.time() - self.last_stats_refresh > 60
@@ -207,7 +208,7 @@ class MarketAggregator:
             self.usd_reference = await self._reference.fetch_usd_prices()
             self.usd_reference_ts = time.time()
         except Exception as exc:
-            log.debug("reference fetch failed: %s", exc)
+            log.exception("reference fetch failed")
 
     # --------------------------------------------------------- composites --
     def composite_mid(self, base: str) -> Optional[float]:
