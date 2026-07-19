@@ -48,6 +48,7 @@ class MarketAggregator:
                                              "USDT": "tether"}))
         self._unresolvable: set = set()
         self._vol_warned: set = set()
+        self._fetch_warned: Dict[Tuple[str, str], float] = {}
         self.reload_connectors()
 
     # ------------------------------------------------------------- config --
@@ -167,7 +168,17 @@ class MarketAggregator:
             self.market_state[key] = snap
             metrics_engine.ingest(snap)
         except Exception as exc:
-            log.debug("%s %s fetch failed: %s", connector.exchange_name, base, exc)
+            # surface feed failures in the in-app logs (throttled: once per
+            # venue+asset per 5 minutes) — this is how geo-blocks show up
+            now_warn = time.time()
+            if now_warn - self._fetch_warned.get(key, 0) > 300:
+                self._fetch_warned[key] = now_warn
+                log.warning("%s %s order-book fetch FAILED: %s: %s "
+                            "(run Admin → connectivity test)",
+                            connector.exchange_name, base,
+                            type(exc).__name__, str(exc)[:200])
+            else:
+                log.debug("%s %s fetch failed: %s", connector.exchange_name, base, exc)
             prev = self.market_state.get(key)
             if prev:
                 prev.status = MarketStatus.OFFLINE.value
@@ -208,7 +219,7 @@ class MarketAggregator:
             self.usd_reference = await self._reference.fetch_usd_prices()
             self.usd_reference_ts = time.time()
         except Exception as exc:
-            log.exception("reference fetch failed")
+            log.debug("reference fetch failed: %s", exc)
 
     # --------------------------------------------------------- composites --
     def composite_mid(self, base: str) -> Optional[float]:

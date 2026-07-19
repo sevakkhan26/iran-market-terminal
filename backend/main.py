@@ -30,6 +30,8 @@ from app.candles import candle_service, HISTORY_WINDOWS, TF_SPEC
 from app.config import CONFIG, exchange_color, taker_fee_pct
 from app.connectors import close_client
 from app.demo_seed import seed_if_needed
+from app.diagnostics import (connectivity_test, environment_report,
+                             install_log_capture, ring_handler)
 from app.intelligence import arb_ledger, inventory_requirements, tob_tracker
 from app.metrics import metrics_engine
 from app.news import news_service
@@ -38,6 +40,7 @@ from app.settings import settings_store
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+install_log_capture()   # every log line also goes to the in-app ring buffer
 log = logging.getLogger("terminal")
 
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
@@ -471,6 +474,28 @@ def get_health() -> JSONResponse:
             "server_time": now,
         },
     )
+
+
+# ------------------------------------------------------------ diagnostics ---
+
+@app.get("/api/logs")
+def get_logs(level: str = Query("INFO"),
+             limit: int = Query(300, ge=1, le=2000),
+             search: str = Query("")) -> List[Dict[str, Any]]:
+    """Recent backend log records (in-memory ring buffer)."""
+    return ring_handler.tail(level, limit, search)
+
+
+@app.get("/api/diagnostics")
+def get_diagnostics() -> Dict[str, Any]:
+    """Instant health report: env, auth vars, disk, DB, feeds, connectors."""
+    return environment_report(market_aggregator, news_service)
+
+
+@app.post("/api/diagnostics/nettest")
+async def run_nettest() -> List[Dict[str, Any]]:
+    """Probe every upstream API from this server — reveals geo-blocks."""
+    return await connectivity_test()
 
 
 # ------------------------------------------------------------------- meta ---

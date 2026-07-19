@@ -1,8 +1,183 @@
-// Data management: add exchanges/pairs at runtime, tune settings.
-import { useState } from 'react';
+// Data management: add exchanges/pairs at runtime, tune settings, diagnostics.
+import { useEffect, useRef, useState } from 'react';
 import { apiDelete, apiGet, apiPost, usePoll } from '../api';
+import { StatusDot } from '../components';
+import { IconActivity, IconAlert, IconCheck } from '../icons';
 import { useLang } from '../i18n';
-import { fmtDateTime } from '../util';
+import { fmtDateTime, timeAgo } from '../util';
+
+/* ------------------------- system diagnostics ------------------------- */
+
+function DiagnosticsCard({ t, lang }) {
+  const [diag, setDiag] = useState(null);
+  const [net, setNet] = useState(null);
+  const [testing, setTesting] = useState(false);
+
+  usePoll('/diagnostics', setDiag, 15000);
+
+  const runNetTest = async () => {
+    setTesting(true); setNet(null);
+    try { setNet(await apiPost('/diagnostics/nettest', {})); }
+    catch (e) { setNet([{ target: 'nettest', ok: false, detail: e.message }]); }
+    finally { setTesting(false); }
+  };
+
+  if (!diag) return <div className="card"><div className="skel" style={{ height: 160 }} /></div>;
+
+  const checks = Object.entries(diag.checks || {});
+  const failing = checks.filter(([, c]) => !c.ok).length;
+
+  return (
+    <div className="card" style={{ gridColumn: '1 / -1' }}>
+      <h3>
+        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+          <IconActivity size={14} /> {t('diagnostics')}
+          {failing > 0
+            ? <span className="badge critical">{failing}</span>
+            : <span className="badge info">OK</span>}
+        </span>
+        <button className="btn sm" onClick={runNetTest} disabled={testing}>
+          {testing ? '…' : t('runNetTest')}
+        </button>
+      </h3>
+
+      <div style={{ fontSize: 11.5, color: 'var(--text-3)', marginBottom: 10 }} className="num">
+        python {diag.system.python} · {diag.system.platform} ·{' '}
+        {diag.system.serverless ? 'SERVERLESS' : 'server'} ·{' '}
+        {diag.system.demo_mode ? 'DEMO' : 'live'} · log {diag.system.log_level} ·{' '}
+        {diag.system.uptime_hint}
+      </div>
+
+      <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 330px), 1fr))', gap: 6 }}>
+        {checks.map(([name, c]) => (
+          <div key={name} style={{ display: 'flex', gap: 8, alignItems: 'flex-start',
+                                   padding: '6px 8px', background: 'var(--bg-2)',
+                                   borderRadius: 7, fontSize: 12,
+                                   border: `1px solid ${c.ok ? 'var(--border)' : '#ea394355'}` }}>
+            <span style={{ color: c.ok ? 'var(--green)' : 'var(--red)', flexShrink: 0 }}>
+              {c.ok ? <IconCheck size={14} /> : <IconAlert size={14} />}
+            </span>
+            <span style={{ minWidth: 0 }}>
+              <b>{name.replace(/_/g, ' ')}</b>
+              <div style={{ color: c.ok ? 'var(--text-3)' : 'var(--red)',
+                            fontSize: 11, wordBreak: 'break-word' }}>{c.detail}</div>
+            </span>
+          </div>
+        ))}
+      </div>
+
+      {diag.venues?.length > 0 && (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 10 }}>
+          {diag.venues.map((v, i) => (
+            <span key={i} className="chip" style={{ cursor: 'default', fontSize: 11 }}>
+              <StatusDot status={v.status} /> {v.exchange} {v.base}
+              {v.age_sec != null && <span style={{ color: 'var(--text-3)' }}> · {v.age_sec}s</span>}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {net && (
+        <div className="tbl-scroll" style={{ marginTop: 12 }}>
+          <table className="tbl">
+            <thead><tr>
+              <th>{t('target')}</th><th>{t('status')}</th>
+              <th>{t('latency')}</th><th>{t('detail')}</th>
+            </tr></thead>
+            <tbody>
+              {net.map((r, i) => (
+                <tr key={i}>
+                  <td><b>{r.target}</b></td>
+                  <td style={{ color: r.ok ? 'var(--green)' : 'var(--red)', fontWeight: 700 }}>
+                    {r.ok ? 'OK' : 'FAILED'}{r.status ? ` (${r.status})` : ''}
+                  </td>
+                  <td className="num">{r.latency_ms}ms</td>
+                  <td style={{ fontSize: 11, color: 'var(--text-2)', wordBreak: 'break-word' }}>
+                    {r.detail}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------ live logs ----------------------------- */
+
+const LEVEL_COLORS = { DEBUG: 'var(--text-3)', INFO: 'var(--text-2)',
+                       WARNING: 'var(--amber)', ERROR: 'var(--red)',
+                       CRITICAL: 'var(--red)' };
+
+function LogsCard({ t, lang }) {
+  const [logs, setLogs] = useState([]);
+  const [level, setLevel] = useState('INFO');
+  const [search, setSearch] = useState('');
+  const boxRef = useRef(null);
+
+  usePoll(`/logs?level=${level}&limit=400&search=${encodeURIComponent(search)}`,
+          setLogs, 5000, [level, search]);
+
+  useEffect(() => {
+    const el = boxRef.current;
+    if (el) el.scrollTop = el.scrollHeight;      // follow the tail
+  }, [logs]);
+
+  const download = () => {
+    const text = logs.map((r) =>
+      `${new Date(r.ts * 1000).toISOString()} ${r.level.padEnd(7)} ${r.logger}: ${r.message}`
+    ).join('\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+    a.download = `terminal-logs-${Date.now()}.txt`;
+    a.click();
+  };
+
+  return (
+    <div className="card" style={{ gridColumn: '1 / -1' }}>
+      <h3>
+        {t('liveLogs')}
+        <span style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <input className="input" style={{ width: 160, padding: '3px 9px', fontSize: 12 }}
+                 placeholder={t('searchLogs')} value={search}
+                 onChange={(e) => setSearch(e.target.value)} />
+          <select className="input" style={{ width: 'auto', padding: '3px 8px', fontSize: 12 }}
+                  value={level} onChange={(e) => setLevel(e.target.value)}>
+            {['DEBUG', 'INFO', 'WARNING', 'ERROR'].map((l) =>
+              <option key={l} value={l}>{l}</option>)}
+          </select>
+          <button className="btn ghost sm" onClick={download}>{t('download')}</button>
+        </span>
+      </h3>
+      <div ref={boxRef}
+           style={{ maxHeight: 340, overflowY: 'auto', background: 'var(--bg)',
+                    borderRadius: 8, border: '1px solid var(--border)',
+                    padding: '8px 10px', fontFamily: 'var(--mono)', fontSize: 11,
+                    lineHeight: 1.55, direction: 'ltr', textAlign: 'left' }}>
+        {logs.map((r, i) => (
+          <div key={i} style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
+            <span style={{ color: 'var(--text-3)' }}>
+              {new Date(r.ts * 1000).toLocaleTimeString('en-GB')}
+            </span>{' '}
+            <b style={{ color: LEVEL_COLORS[r.level] || 'var(--text)' }}>{r.level}</b>{' '}
+            <span style={{ color: 'var(--accent)' }}>{r.logger}</span>{' '}
+            {r.message}
+          </div>
+        ))}
+        {!logs.length && (
+          <div style={{ color: 'var(--text-3)' }}>
+            — no records at level {level}{search ? ` matching "${search}"` : ''} —
+          </div>
+        )}
+      </div>
+      <div style={{ fontSize: 10.5, color: 'var(--text-3)', marginTop: 6 }}>
+        {t('logHint')}
+      </div>
+    </div>
+  );
+}
 
 const SPEC_PLACEHOLDER = `{
   "orderbook_url": "https://api.example.com/depth?symbol={symbol}",
@@ -73,7 +248,7 @@ export default function Admin({ meta, refreshMeta }) {
     <div>
       <h2 style={{ fontSize: 18, marginBottom: 4 }}>{t('admin')}</h2>
       <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginBottom: 14,
-                    fontFamily: 'var(--font-mono, monospace)' }}
+                    fontFamily: 'var(--mono, monospace)' }}
            title="Build currently running on the server">
         v{meta?.version || '2.0.0'}
         {meta?.build?.git_sha && meta.build.git_sha !== 'dev' ? ` · ${meta.build.git_sha}` : ''}
@@ -84,6 +259,8 @@ export default function Admin({ meta, refreshMeta }) {
       {err && <div className="toast critical" style={{ position: 'static', marginBottom: 12 }}>{err}</div>}
 
       <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 360px), 1fr))' }}>
+        <DiagnosticsCard t={t} lang={lang} />
+        <LogsCard t={t} lang={lang} />
         {/* settings */}
         <div className="card">
           <h3>{t('settings')}</h3>
