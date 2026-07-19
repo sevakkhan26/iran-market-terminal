@@ -107,7 +107,7 @@ _loop_tasks: Dict[str, asyncio.Task] = {}
 _shutting_down = False
 _STARTED_AT = time.time()
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 
 def _resolve_build_info() -> Dict[str, str]:
@@ -288,6 +288,7 @@ async def lifespan(app: FastAPI):
     if AUTH_ENABLED and auth_service.default_creds:
         log.warning("Using default credentials admin/admin — set AUTH_USERNAME/"
                     "AUTH_PASSWORD_HASH/AUTH_TOKEN_SECRET env variables")
+    auth_service.bootstrap()   # seed the env admin as the first DB user if none exist
     seed_if_needed()
     if not RUN_COLLECTOR:
         log.warning("COLLECTOR DISABLED (serverless mode) — no background polling "
@@ -409,6 +410,22 @@ class LoginIn(BaseModel):
     password: str
 
 
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str
+
+
+class CreateUserIn(BaseModel):
+    username: str
+    password: str
+    role: str = "operator"
+
+
+def _bearer(request: Request) -> Optional[str]:
+    header = request.headers.get("authorization", "")
+    return header[7:] if header.lower().startswith("bearer ") else None
+
+
 @app.post("/api/auth/login")
 def auth_login(body: LoginIn) -> Dict[str, Any]:
     if not AUTH_ENABLED:
@@ -423,8 +440,9 @@ def auth_login(body: LoginIn) -> Dict[str, Any]:
 
 
 @app.post("/api/auth/logout")
-def auth_logout() -> Dict[str, Any]:
-    return {"ok": True}   # stateless tokens: the client just drops its token
+def auth_logout(request: Request) -> Dict[str, Any]:
+    auth_service.logout(_bearer(request))
+    return {"ok": True}
 
 
 @app.get("/api/auth/me")
@@ -432,14 +450,61 @@ def auth_me(request: Request) -> Dict[str, Any]:
     user = getattr(request.state, "user", None)
     if not user:
         return {"username": "anonymous", "role": "admin", "default_creds": False}
-    return {"username": user["username"], "role": "admin",
+    return {"username": user["username"], "role": user.get("role", "operator"),
+            "must_change_password": bool(user.get("must_change_password")),
             "default_creds": auth_service.default_creds,
             "env_managed": auth_service.env_managed}
 
 
-# Credentials are environment-managed (AUTH_USERNAME / AUTH_PASSWORD_HASH /
-# AUTH_TOKEN_SECRET). To rotate: update the env vars and redeploy/restart.
-# Generate values:  python3 main.py hash-password "..."  |  generate-secret
+@app.post("/api/auth/change-password")
+def change_password(request: Request, body: ChangePasswordIn) -> Dict[str, Any]:
+    """Any signed-in user can change their own password."""
+    user = getattr(request.state, "user", None)
+    if not user or not user.get("user_id"):
+        raise HTTPException(status_code=401, detail="not authenticated")
+    result = auth_service.change_password(user["user_id"], body.current_password,
+                                          body.new_password)
+    if result is None:
+        raise HTTPException(status_code=422,
+                            detail="new password must be at least 6 characters")
+    if not result:
+        raise HTTPException(status_code=403, detail="current password is incorrect")
+    return {"ok": True}
+
+
+# ------------------------------------------------------------ user management
+# admin role only (require_admin). operators get 403.
+
+@app.get("/api/users", dependencies=[Depends(require_admin)])
+def list_users() -> List[Dict[str, Any]]:
+    return auth_service.list_users()
+
+
+@app.post("/api/users", dependencies=[Depends(require_admin)])
+def create_user(body: CreateUserIn) -> Dict[str, Any]:
+    result = auth_service.create_user(body.username, body.password, body.role)
+    err = (result or {}).get("error")
+    if err == "username":
+        raise HTTPException(status_code=422, detail="username is required")
+    if err == "weak":
+        raise HTTPException(status_code=422, detail="password must be at least 6 characters")
+    if err == "exists":
+        raise HTTPException(status_code=409, detail="a user with that name already exists")
+    return result
+
+
+@app.delete("/api/users/{user_id}", dependencies=[Depends(require_admin)])
+def remove_user(user_id: int, request: Request) -> Dict[str, Any]:
+    acting = getattr(request.state, "user", None) or {}
+    result = auth_service.delete_user(user_id, acting.get("user_id"))
+    err = result.get("error")
+    if err == "self":
+        raise HTTPException(status_code=422, detail="you cannot delete your own account")
+    if err == "last_admin":
+        raise HTTPException(status_code=422, detail="cannot delete the last admin user")
+    if err == "notfound":
+        raise HTTPException(status_code=404, detail="user not found")
+    return result
 
 
 # ----------------------------------------------------------------- health ---

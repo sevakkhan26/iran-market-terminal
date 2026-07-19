@@ -223,6 +223,11 @@ textarea.input { font-family: var(--mono); font-size: 12px; min-height: 140px; }
 .notifc-x:hover { color: var(--text); }
 @media (max-width: 640px) { .notifc { inset-inline: 12px; width: auto; } .notifc-item { width: auto; } }
 
+/* profile dialogs (change password / manage users) */
+.umodal-overlay { position: fixed; inset: 0; z-index: 200; background: #00000088; backdrop-filter: blur(2px); display: flex; align-items: flex-start; justify-content: center; padding: 12vh 16px 16px; }
+.umodal { width: 420px; max-width: 100%; background: var(--card); border: 1px solid var(--border-2); border-radius: 12px; padding: 16px; box-shadow: 0 20px 60px #000000bb; animation: slideIn .2s ease-out; }
+.umodal-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+
 .chart-box { position: relative; width: 100%; }
 .skel { background: linear-gradient(90deg, var(--card) 25%, var(--card-2) 50%, var(--card) 75%); background-size: 200% 100%; animation: shimmer 1.4s infinite; border-radius: 6px; }
 @keyframes shimmer { to { background-position: -200% 0; } }

@@ -4,6 +4,7 @@ import { apiGet, apiPost, getToken, setAuthErrorHandler, setToken,
 import { Badge, Countdown } from './components';
 import CommandPalette from './CommandPalette';
 import NotificationCenter from './NotificationCenter';
+import { ChangePasswordModal, ManageUsersModal } from './UserAdmin';
 import { IconBell, IconCheck, IconCommand, IconRows, IconX } from './icons';
 import { useLang } from './i18n';
 import Login from './Login';
@@ -59,6 +60,8 @@ function Terminal({ authUser, onLogout, onUserUpdate }) {
   const [calendar, setCalendar] = useState([]);
   const [compact, setCompact] = useState(() => localStorage.getItem('density') === 'compact');
   const [userMenu, setUserMenu] = useState(false);
+  const [pwOpen, setPwOpen] = useState(false);
+  const [usersOpen, setUsersOpen] = useState(false);
 
   const refreshMeta = () => apiGet('/meta').then(setMeta).catch(() => {});
   useEffect(() => { refreshMeta(); }, []);
@@ -171,8 +174,21 @@ function Terminal({ authUser, onLogout, onUserUpdate }) {
             </button>
             {userMenu && (
               <div className="card" style={{ position: 'absolute', top: '110%',
-                    insetInlineEnd: 0, zIndex: 60, minWidth: 180, padding: 8,
+                    insetInlineEnd: 0, zIndex: 60, minWidth: 190, padding: 8,
                     boxShadow: '0 10px 34px #000000aa' }}>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', padding: '4px 10px 6px' }}>
+                  {authUser.username} · {authUser.role === 'admin' ? t('roleAdmin') : t('roleOperator')}
+                </div>
+                <button className="palette-item"
+                        onClick={() => { setUserMenu(false); setPwOpen(true); }}>
+                  {t('changePassword')}
+                </button>
+                {authUser.role === 'admin' && (
+                  <button className="palette-item"
+                          onClick={() => { setUserMenu(false); setUsersOpen(true); }}>
+                    {t('manageUsers')}
+                  </button>
+                )}
                 <button className="palette-item" style={{ color: 'var(--red)' }}
                         onClick={onLogout}>
                   {t('logout')}
@@ -273,12 +289,6 @@ function Terminal({ authUser, onLogout, onUserUpdate }) {
                         label: compact ? t('densityComfort') : t('densityCompact'),
                         run: () => setCompact(!compact),
                       }]} />
-          onDone={(newUsername) => {
-            setPwModal(false);
-            onUserUpdate({ ...authUser, username: newUsername || authUser.username,
-                           default_creds: false });
-          }} />
-      )}
 
       <div className="toast-wrap">
         {toasts.map((a) => (
@@ -292,6 +302,9 @@ function Terminal({ authUser, onLogout, onUserUpdate }) {
       {/* operational notifications: node disconnects, upcoming events, breaking news */}
       <NotificationCenter markets={marketsSnap} calendar={calendar}
                           venues={(meta?.exchanges || []).map((e) => e.name)} />
+
+      {pwOpen && <ChangePasswordModal onClose={() => setPwOpen(false)} />}
+      {usersOpen && <ManageUsersModal me={authUser} onClose={() => setUsersOpen(false)} />}
     </div>
   );
 }
