@@ -37,6 +37,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY backend/ /app/backend/
 COPY --from=frontend /build/frontend/dist /app/frontend/dist
 
+# Build stamp — so /api/meta and the Admin page show exactly what's deployed.
+# Placed after the source COPY so it refreshes whenever the code changes.
+# Pass a commit with:  docker compose build --build-arg GIT_SHA=$(git rev-parse --short HEAD)
+ARG GIT_SHA=unknown
+ENV APP_GIT_SHA=$GIT_SHA
+RUN date -u +"%Y-%m-%dT%H:%M:%SZ" > /app/backend/.build_time
+
 # Run as a non-root user; a named volume mounted at /data inherits its ownership
 RUN useradd --system --create-home --uid 10001 appuser \
     && mkdir -p /data \

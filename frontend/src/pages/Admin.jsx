@@ -71,7 +71,16 @@ export default function Admin({ meta, refreshMeta }) {
 
   return (
     <div>
-      <h2 style={{ fontSize: 18, marginBottom: 14 }}>{t('admin')}</h2>
+      <h2 style={{ fontSize: 18, marginBottom: 4 }}>{t('admin')}</h2>
+      <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginBottom: 14,
+                    fontFamily: 'var(--font-mono, monospace)' }}
+           title="Build currently running on the server">
+        v{meta?.version || '2.0.0'}
+        {meta?.build?.git_sha && meta.build.git_sha !== 'dev' ? ` · ${meta.build.git_sha}` : ''}
+        {meta?.build?.build_time && meta.build.build_time !== 'unknown'
+          ? ` · built ${meta.build.build_time}` : ''}
+        {meta?.collector_enabled === false ? ' · ⚠ collector OFF' : ''}
+      </div>
       {err && <div className="toast critical" style={{ position: 'static', marginBottom: 12 }}>{err}</div>}
 
       <div className="grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 360px), 1fr))' }}>

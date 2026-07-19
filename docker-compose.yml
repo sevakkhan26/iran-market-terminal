@@ -12,7 +12,13 @@
 
 services:
   terminal:
-    build: .
+    build:
+      context: .
+      args:
+        # Optional: stamp the running build with the git commit so the Admin
+        # page shows it. Set GIT_SHA in your shell before `up --build`, e.g.:
+        #   GIT_SHA=$(git rev-parse --short HEAD) docker compose up -d --build
+        GIT_SHA: "${GIT_SHA:-unknown}"
     image: iran-market-terminal:latest
     container_name: iran-market-terminal
     restart: unless-stopped

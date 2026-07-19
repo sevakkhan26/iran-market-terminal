@@ -104,6 +104,27 @@ _loop_tasks: Dict[str, asyncio.Task] = {}
 _shutting_down = False
 _STARTED_AT = time.time()
 
+APP_VERSION = "2.0.0"
+
+
+def _resolve_build_info() -> Dict[str, str]:
+    """Version + build stamp, so you can confirm which build is actually running
+    (shown on the Admin page). git_sha/build_time are baked into the Docker image
+    at build time; outside Docker they fall back to 'dev'/'unknown'."""
+    here = Path(__file__).resolve().parent
+    sha = os.environ.get("APP_GIT_SHA", "").strip()
+    build_time = os.environ.get("APP_BUILD_TIME", "").strip()
+    if not build_time:
+        try:
+            build_time = (here / ".build_time").read_text(encoding="utf-8").strip()
+        except OSError:
+            build_time = ""
+    return {"version": APP_VERSION, "git_sha": sha or "dev",
+            "build_time": build_time or "unknown"}
+
+
+BUILD_INFO = _resolve_build_info()
+
 
 async def _run_loop(name: str, work, interval_getter, work_timeout: float) -> None:
     health = LOOP_HEALTH.setdefault(
@@ -457,7 +478,9 @@ def get_health() -> JSONResponse:
 @app.get("/api/meta")
 def get_meta() -> Dict[str, Any]:
     return {
-        "app": "Iran Market Terminal", "version": "2.0.0",
+        "app": "Iran Market Terminal", "version": APP_VERSION,
+        "build": BUILD_INFO,
+        "collector_enabled": RUN_COLLECTOR,
         "demo_mode": bool(CONFIG.get("demo_mode")),
         "quote_currency": CONFIG.get("quote_currency", "TMN"),
         "exchanges": [
