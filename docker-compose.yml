@@ -1,0 +1,42 @@
+# Iran Market Terminal — production deployment.
+#
+#   docker compose up -d --build      # build & start (rebuild after every git pull)
+#   docker compose logs -f            # watch logs (look for "heartbeat" every 60s)
+#   docker compose ps                 # STATUS should say "healthy"
+#   docker compose down               # stop
+#
+# Auth secrets come from a .env file in THIS folder (see .env.example). Without
+# them the app runs with a loud admin/admin warning — fine to try, set them for
+# real use. The database lives in the named volume `terminal-data` and survives
+# rebuilds/restarts.
+
+services:
+  terminal:
+    build: .
+    image: iran-market-terminal:latest
+    container_name: iran-market-terminal
+    restart: unless-stopped
+    ports:
+      - "${PORT:-4000}:4000"
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "4000"
+      RUN_COLLECTOR: "1"                 # NEVER disable — this is the collector
+      TERMINAL_DATA_DIR: "/data"
+      DEMO_MODE: "${DEMO_MODE:-}"
+      AUTH_USERNAME: "${AUTH_USERNAME:-admin}"
+      AUTH_PASSWORD_HASH: "${AUTH_PASSWORD_HASH:-}"
+      AUTH_TOKEN_SECRET: "${AUTH_TOKEN_SECRET:-}"
+      AUTH_PASSWORD: "${AUTH_PASSWORD:-}"
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
+    volumes:
+      - terminal-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4000/api/health', timeout=6).status==200 else 1)"]
+      interval: 30s
+      timeout: 8s
+      start_period: 90s
+      retries: 3
+
+volumes:
+  terminal-data:

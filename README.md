@@ -26,6 +26,54 @@ DEMO_MODE=1 python3 main.py
 
 Open **http://127.0.0.1:4000**.
 
+## Deploy on a server (Docker) — recommended
+
+This is the supported way to run it on a server. One image builds the frontend
+and runs the API **plus the continuous background collector** in one long-lived
+process. **Do not deploy the serverless entrypoint (`backend/api/index.py`) on a
+server** — that mode disables the collector on purpose, which looks like "the UI
+loads but data never updates."
+
+```bash
+git clone https://github.com/sevakkhan26/iran-market-terminal.git
+cd iran-market-terminal
+cp .env.example .env            # optional: set AUTH_* now, or run with defaults first
+docker compose up -d --build    # build + start
+docker compose ps               # STATUS should become "healthy"
+docker compose logs -f          # you should see a "heartbeat" line every ~60s
+```
+
+Open **http://SERVER_IP:4000**.
+
+**After every `git pull`, rebuild** — otherwise Docker keeps running the old
+image (the #1 cause of "my fix didn't take effect"):
+
+```bash
+git pull && docker compose up -d --build
+```
+
+Reliability built in:
+
+- **Always collects.** The image sets `RUN_COLLECTOR=1`; polling can't be
+  silently disabled.
+- **Self-healing.** Each loop is timeout-bounded and auto-restarts; a stuck
+  network/DB call aborts its cycle instead of freezing collection.
+- **Self-restarting.** If market data goes stale for >5 min (process wedged), a
+  watchdog exits and `restart: unless-stopped` brings up a clean container — **no
+  more manual `docker restart`.** Tune with `WATCHDOG_STALE_EXIT_SEC`.
+- **Observable.** `GET /api/health` returns `200` while data is fresh, `503`
+  when stale (drives the Docker health check); logs print a per-loop heartbeat.
+- **Persistent.** The SQLite database lives in the `terminal-data` volume and
+  survives rebuilds/restarts.
+
+Generate the auth secrets once the image is built:
+
+```bash
+docker compose run --rm terminal python main.py hash-password "your-strong-password"
+docker compose run --rm terminal python main.py generate-secret
+# paste both into .env, then:  docker compose up -d
+```
+
 ## Authentication (environment-driven, two secrets)
 
 Single account, configured entirely through environment variables — no

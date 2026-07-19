@@ -9,6 +9,7 @@ import asyncio
 import logging
 import os
 import statistics
+import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -101,6 +102,7 @@ alert_engine.add_listener(ws_manager.broadcast)
 LOOP_HEALTH: Dict[str, Dict[str, float]] = {}
 _loop_tasks: Dict[str, asyncio.Task] = {}
 _shutting_down = False
+_STARTED_AT = time.time()
 
 
 async def _run_loop(name: str, work, interval_getter, work_timeout: float) -> None:
@@ -207,11 +209,51 @@ async def _heartbeat_loop() -> None:
             pass
 
 
-# Serverless platforms (Vercel sets VERCEL=1; api/index.py sets SERVERLESS=1)
-# can't host background loops — requests are short-lived. The API still works
-# (auth, static UI, whatever data a warm instance manages to fetch), but for
-# continuous collection run `python3 main.py` on a real server.
-IS_SERVERLESS = bool(os.environ.get("VERCEL") or os.environ.get("SERVERLESS"))
+# ------------------------------------------------------------- collector ---
+# Whether THIS process runs the continuous background collector. Long-lived
+# servers (Docker, VPS, `python main.py`) MUST run it; only true serverless
+# platforms (Vercel), where each request is a short-lived function, skip it.
+# An explicit RUN_COLLECTOR always wins, so a container can never *silently*
+# end up with polling disabled (the "UI up but no new data" failure).
+def _collector_enabled() -> bool:
+    override = os.environ.get("RUN_COLLECTOR")
+    if override is not None:
+        return override.strip().lower() in ("1", "true", "yes", "on")
+    return not bool(os.environ.get("VERCEL") or os.environ.get("SERVERLESS"))
+
+
+RUN_COLLECTOR = _collector_enabled()
+
+# Hard self-restart watchdog. If the market collector stops producing fresh data
+# for this long, the process is wedged (stuck thread / exhausted sockets or
+# memory) in a way in-process recovery cannot fix. The watchdog runs on its own
+# OS thread — immune to event-loop hangs — and exits the process so the
+# container's restart policy brings up a clean one. This is what makes "the UI
+# is up but the data is frozen and I have to restart Docker by hand" impossible.
+WATCHDOG_STALE_EXIT = float(os.environ.get("WATCHDOG_STALE_EXIT_SEC", "300"))
+
+
+def _watchdog_thread() -> None:
+    while not _shutting_down:
+        time.sleep(15)
+        last = LOOP_HEALTH.get("market", {}).get("last_success", 0.0)
+        if not last:
+            continue                       # never succeeded yet: startup grace
+        age = time.time() - last
+        if age > WATCHDOG_STALE_EXIT:
+            log.critical("WATCHDOG: market data stale for %.0fs (> %.0fs) — the "
+                         "process is wedged; exiting for a clean container restart",
+                         age, WATCHDOG_STALE_EXIT)
+            os._exit(1)
+
+
+def _start_watchdog() -> None:
+    if os.environ.get("WATCHDOG_DISABLED", "").strip().lower() in ("1", "true", "yes"):
+        log.warning("watchdog disabled via WATCHDOG_DISABLED")
+        return
+    threading.Thread(target=_watchdog_thread, name="watchdog", daemon=True).start()
+    log.info("watchdog active — will restart if market data goes stale > %.0fs",
+             WATCHDOG_STALE_EXIT)
 
 
 @asynccontextmanager
@@ -223,10 +265,12 @@ async def lifespan(app: FastAPI):
         log.warning("Using default credentials admin/admin — set AUTH_USERNAME/"
                     "AUTH_PASSWORD_HASH/AUTH_TOKEN_SECRET env variables")
     seed_if_needed()
-    if IS_SERVERLESS:
-        log.warning("Serverless mode: background polling loops disabled")
+    if not RUN_COLLECTOR:
+        log.warning("COLLECTOR DISABLED (serverless mode) — no background polling "
+                    "in this process. Set RUN_COLLECTOR=1 to force it on.")
         asyncio.create_task(_safe_first_poll())   # best-effort, non-blocking
     else:
+        log.info("COLLECTOR ENABLED — starting supervised background loops")
         try:  # prime state once so the first requests aren't empty (bounded)
             await asyncio.wait_for(market_aggregator.update_markets(), timeout=40)
         except Exception as exc:
@@ -243,6 +287,7 @@ async def lifespan(app: FastAPI):
         _spawn_loop("prune", _prune_work, lambda: 3600.0, 60)
         _loop_tasks["heartbeat"] = asyncio.create_task(
             _heartbeat_loop(), name="loop:heartbeat")
+        _start_watchdog()
     yield
     _shutting_down = True
     for t in _loop_tasks.values():
@@ -267,7 +312,7 @@ app.add_middleware(
 )
 
 AUTH_ENABLED = bool(CONFIG.get("auth_enabled", True))
-AUTH_EXEMPT = ("/api/auth/login",)
+AUTH_EXEMPT = ("/api/auth/login", "/api/health")
 
 
 @app.middleware("http")
@@ -371,6 +416,40 @@ def auth_me(request: Request) -> Dict[str, Any]:
 # Credentials are environment-managed (AUTH_USERNAME / AUTH_PASSWORD_HASH /
 # AUTH_TOKEN_SECRET). To rotate: update the env vars and redeploy/restart.
 # Generate values:  python3 main.py hash-password "..."  |  generate-secret
+
+
+# ----------------------------------------------------------------- health ---
+
+@app.get("/api/health")
+def get_health() -> JSONResponse:
+    """Unauthenticated liveness/readiness for the container health check.
+
+    Healthy while the collector is producing fresh market data (or when the
+    collector is intentionally disabled). Returns 503 when data is stale, so the
+    orchestrator / Docker HEALTHCHECK notices and the operator can see it."""
+    now = time.time()
+    last = LOOP_HEALTH.get("market", {}).get("last_success", 0.0)
+    age = (now - last) if last else None
+    stale_after = float(os.environ.get("HEALTH_STALE_SEC", "120"))
+    if not RUN_COLLECTOR:
+        healthy = True                              # collector off by design
+    elif age is None:
+        healthy = (now - _STARTED_AT) < 120         # still warming up
+    else:
+        healthy = age <= stale_after
+    return JSONResponse(
+        status_code=200 if healthy else 503,
+        content={
+            "status": "ok" if healthy else "stale",
+            "collector_enabled": RUN_COLLECTOR,
+            "market_last_update_age_sec": round(age, 1) if age is not None else None,
+            "loops": {k: (round(now - v["last_success"], 1)
+                          if v.get("last_success") else None)
+                      for k, v in LOOP_HEALTH.items()},
+            "uptime_sec": round(now - _STARTED_AT, 1),
+            "server_time": now,
+        },
+    )
 
 
 # ------------------------------------------------------------------- meta ---
