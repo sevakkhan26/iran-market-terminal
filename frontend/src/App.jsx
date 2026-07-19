@@ -3,6 +3,7 @@ import { apiGet, apiPost, getToken, setAuthErrorHandler, setToken,
          useLiveStream, usePoll } from './api';
 import { Badge, Countdown } from './components';
 import CommandPalette from './CommandPalette';
+import NotificationCenter from './NotificationCenter';
 import { IconBell, IconCheck, IconCommand, IconRows, IconX } from './icons';
 import { useLang } from './i18n';
 import Login from './Login';
@@ -49,6 +50,7 @@ function Terminal({ authUser, onLogout, onUserUpdate }) {
   const [asset, setAsset] = useState(() => location.hash.split('/')[1] || 'BTC');
   const [meta, setMeta] = useState(null);
   const [overview, setOverview] = useState([]);
+  const [marketsSnap, setMarketsSnap] = useState([]);
   const [toasts, setToasts] = useState([]);
   const [wsLive, setWsLive] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -94,7 +96,7 @@ function Terminal({ authUser, onLogout, onUserUpdate }) {
   const go = (p, a) => { location.hash = a ? `${p}/${a}` : p; setPage(p); if (a) setAsset(a); };
 
   useLiveStream({
-    markets: () => setWsLive(true),
+    markets: (msg) => { setWsLive(true); if (msg && msg.data) setMarketsSnap(msg.data); },
     alert: (msg) => {
       const item = { ...msg.data, key: Math.random() };
       setToasts((prev) => [...prev.slice(-3), item]);
@@ -286,6 +288,10 @@ function Terminal({ authUser, onLogout, onUserUpdate }) {
           </div>
         ))}
       </div>
+
+      {/* operational notifications: node disconnects, upcoming events, breaking news */}
+      <NotificationCenter markets={marketsSnap} calendar={calendar}
+                          venues={(meta?.exchanges || []).map((e) => e.name)} />
     </div>
   );
 }

@@ -205,6 +205,24 @@ textarea.input { font-family: var(--mono); font-size: 12px; min-height: 140px; }
 .toast.info { border-inline-start-color: var(--accent); }
 @keyframes slideIn { from { transform: translateY(14px); opacity: 0; } }
 
+/* operational notification center (top-right) — distinct from .toast-wrap */
+.notifc { position: fixed; top: 66px; inset-inline-end: 16px; z-index: 120; display: flex; flex-direction: column; align-items: flex-end; gap: 8px; width: 330px; max-width: calc(100vw - 24px); }
+.notifc-head { position: relative; }
+.notifc-gear { background: var(--card); border: 1px solid var(--border-2); color: var(--text-2); width: 30px; height: 30px; border-radius: 8px; cursor: pointer; font-size: 15px; box-shadow: 0 4px 14px #00000055; }
+.notifc-gear:hover { color: var(--text); }
+.notifc-settings { position: absolute; inset-inline-end: 0; top: 36px; width: 260px; background: var(--card); border: 1px solid var(--border-2); border-radius: 10px; padding: 12px; box-shadow: 0 10px 34px #000000aa; z-index: 130; }
+.notifc-set-title { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--text-3); margin-bottom: 6px; }
+.notifc-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; padding: 3px 0; cursor: pointer; }
+.notifc-row > span { color: var(--text-2); }
+.notifc-nodes { max-height: 148px; overflow-y: auto; }
+.notifc-item { width: 330px; max-width: calc(100vw - 24px); background: var(--card); border: 1px solid var(--border-2); border-inline-start: 3px solid var(--amber); border-radius: 9px; padding: 10px 12px; box-shadow: 0 8px 30px #00000088; animation: slideIn .25s ease-out; display: flex; gap: 9px; align-items: flex-start; }
+.notifc-item.critical { border-inline-start-color: var(--red); }
+.notifc-item.info { border-inline-start-color: var(--accent); }
+.notifc-item.warning { border-inline-start-color: var(--amber); }
+.notifc-x { margin-inline-start: auto; cursor: pointer; color: var(--text-3); background: none; border: none; font-size: 16px; line-height: 1; padding: 0 2px; }
+.notifc-x:hover { color: var(--text); }
+@media (max-width: 640px) { .notifc { inset-inline: 12px; width: auto; } .notifc-item { width: auto; } }
+
 .chart-box { position: relative; width: 100%; }
 .skel { background: linear-gradient(90deg, var(--card) 25%, var(--card-2) 50%, var(--card) 75%); background-size: 200% 100%; animation: shimmer 1.4s infinite; border-radius: 6px; }
 @keyframes shimmer { to { background-position: -200% 0; } }
