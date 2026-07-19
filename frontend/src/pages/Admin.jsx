@@ -250,7 +250,7 @@ export default function Admin({ meta, refreshMeta }) {
       <div style={{ fontSize: 11.5, color: 'var(--text-2)', marginBottom: 14,
                     fontFamily: 'var(--mono, monospace)' }}
            title="Build currently running on the server">
-        v{meta?.version || '2.0.0'}
+        v{meta?.version || '2.1.0'}
         {meta?.build?.git_sha && meta.build.git_sha !== 'dev' ? ` · ${meta.build.git_sha}` : ''}
         {meta?.build?.build_time && meta.build.build_time !== 'unknown'
           ? ` · built ${meta.build.build_time}` : ''}

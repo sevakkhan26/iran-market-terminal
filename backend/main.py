@@ -107,7 +107,7 @@ _loop_tasks: Dict[str, asyncio.Task] = {}
 _shutting_down = False
 _STARTED_AT = time.time()
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 
 def _resolve_build_info() -> Dict[str, str]:
@@ -327,7 +327,7 @@ async def _safe_first_poll() -> None:
         log.warning("serverless first poll failed: %s", exc)
 
 
-app = FastAPI(title="Iran Market Terminal", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Iran Market Terminal", version=APP_VERSION, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
