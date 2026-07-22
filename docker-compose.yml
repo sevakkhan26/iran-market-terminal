@@ -1,48 +1,74 @@
-# Iran Market Terminal — production deployment.
+# Iran Market Terminal — local + production stack (app + PostgreSQL).
 #
-#   docker compose up -d --build      # build & start (rebuild after every git pull)
-#   docker compose logs -f            # watch logs (look for "heartbeat" every 60s)
-#   docker compose ps                 # STATUS should say "healthy"
-#   docker compose down               # stop
+# First time / after git pull:
+#   cp .env.example .env          # optional: fill AUTH_*
+#   docker compose up -d --build
 #
-# Auth secrets come from a .env file in THIS folder (see .env.example). Without
-# them the app runs with a loud admin/admin warning — fine to try, set them for
-# real use. The database lives in the named volume `terminal-data` and survives
-# rebuilds/restarts.
+# App runs migrations automatically on start (alembic upgrade head).
+# Postgres data persists in the `pgdata` volume.
+#
+#   docker compose logs -f terminal
+#   docker compose ps             # both services should be healthy/up
+#   docker compose down           # stop (data kept)
+#   docker compose down -v        # stop AND wipe database volume
 
 services:
+  db:
+    image: postgres:16-alpine
+    container_name: iran-market-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-terminal}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-terminal}
+      POSTGRES_DB: ${POSTGRES_DB:-terminal}
+    ports:
+      # Published for host-side tools / local `python main.py` without docker app
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-terminal} -d ${POSTGRES_DB:-terminal}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
   terminal:
     build:
       context: .
       args:
-        # Optional: stamp the running build with the git commit so the Admin
-        # page shows it. Set GIT_SHA in your shell before `up --build`, e.g.:
-        #   GIT_SHA=$(git rev-parse --short HEAD) docker compose up -d --build
         GIT_SHA: "${GIT_SHA:-unknown}"
     image: iran-market-terminal:latest
     container_name: iran-market-terminal
     restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
     ports:
       - "${PORT:-4000}:4000"
     environment:
       HOST: "0.0.0.0"
       PORT: "4000"
-      RUN_COLLECTOR: "1"                 # NEVER disable — this is the collector
-      TERMINAL_DATA_DIR: "/data"
+      RUN_COLLECTOR: "1"
       DEMO_MODE: "${DEMO_MODE:-}"
       AUTH_USERNAME: "${AUTH_USERNAME:-admin}"
       AUTH_PASSWORD_HASH: "${AUTH_PASSWORD_HASH:-}"
       AUTH_TOKEN_SECRET: "${AUTH_TOKEN_SECRET:-}"
       AUTH_PASSWORD: "${AUTH_PASSWORD:-}"
       ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
-    volumes:
-      - terminal-data:/data
+      # All persistence → Postgres (no SQLite / settings.json)
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-terminal}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-terminal}
+      POSTGRES_DB: ${POSTGRES_DB:-terminal}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-terminal}:${POSTGRES_PASSWORD:-terminal}@db:5432/${POSTGRES_DB:-terminal}
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4000/api/health', timeout=6).status==200 else 1)"]
       interval: 30s
       timeout: 8s
-      start_period: 90s
-      retries: 3
+      start_period: 120s
+      retries: 5
 
 volumes:
-  terminal-data:
+  pgdata:

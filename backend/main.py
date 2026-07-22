@@ -38,6 +38,8 @@ from app.news import news_service
 from app.premium import METHODS, premium_series
 from app.settings import settings_store
 
+# Migrations run at import so tests / CLI that touch db work after ensure_schema()
+# is called from lifespan (and from the docker entrypoint).
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 install_log_capture()   # every log line also goes to the in-app ring buffer
@@ -107,7 +109,7 @@ _loop_tasks: Dict[str, asyncio.Task] = {}
 _shutting_down = False
 _STARTED_AT = time.time()
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "3.0.0"
 
 
 def _resolve_build_info() -> Dict[str, str]:
@@ -285,6 +287,12 @@ async def lifespan(app: FastAPI):
     global _shutting_down
     _shutting_down = False
     ws_manager.loop = asyncio.get_running_loop()
+    # Schema must exist before auth bootstrap / settings / collector writes.
+    try:
+        db.ensure_schema()
+    except Exception as exc:
+        log.error("Database migration failed: %s", exc)
+        raise
     if AUTH_ENABLED and auth_service.default_creds:
         log.warning("Using default credentials admin/admin — set AUTH_USERNAME/"
                     "AUTH_PASSWORD_HASH/AUTH_TOKEN_SECRET env variables")
@@ -320,6 +328,7 @@ async def lifespan(app: FastAPI):
     for t in _loop_tasks.values():
         t.cancel()
     await close_client()
+    db.close_pool()
 
 
 async def _safe_first_poll() -> None:

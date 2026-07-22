@@ -89,22 +89,17 @@ def environment_report(aggregator, news_service) -> Dict[str, Any]:
     def check(ok: bool, detail: str) -> Dict[str, Any]:
         return {"ok": bool(ok), "detail": detail}
 
-    # data dir / database
+    # database (Postgres)
     try:
-        row_counts = {}
-        for table in ("price_snapshots", "composite_snapshots", "candles",
-                      "calendar_events", "arb_windows"):
-            with db._lock:
-                row_counts[table] = db._connect().execute(
-                    f"SELECT COUNT(*) c FROM {table}").fetchone()["c"]
+        row_counts = db.table_counts()
+        info = db.database_info()
         db_ok = True
-        db_detail = f"{db.DB_PATH} · rows: " + ", ".join(
-            f"{k}={v}" for k, v in row_counts.items())
+        db_detail = (
+            f"postgres://{info['host']}/{info['database']} · rows: "
+            + ", ".join(f"{k}={v}" for k, v in row_counts.items())
+        )
     except Exception as exc:
         db_ok, db_detail, row_counts = False, str(exc), {}
-
-    preferred_dir = os.environ.get("TERMINAL_DATA_DIR") or "backend/data"
-    using_fallback = "terminal-data" in str(db.DATA_DIR) and "tmp" in str(db.DATA_DIR).lower()
 
     # market feed freshness — only slots we actually poll (unsupported pairs
     # are never stored, so they no longer inflate the denominator with red chips)
@@ -141,11 +136,6 @@ def environment_report(aggregator, news_service) -> Dict[str, Any]:
                     os.environ.get("AUTH_USERNAME", "(unset → admin)"),
                     "set" if os.environ.get("AUTH_PASSWORD_HASH") else "MISSING",
                     "set" if os.environ.get("AUTH_TOKEN_SECRET") else "MISSING (derived)")),
-            "data_dir_writable": check(
-                not using_fallback,
-                f"using {db.DATA_DIR}" + (
-                    f" — FALLBACK, '{preferred_dir}' not writable, history is EPHEMERAL"
-                    if using_fallback else " (persistent)")),
             "database": check(db_ok, db_detail),
             "history_accumulating": check(
                 row_counts.get("composite_snapshots", 0) > 0,

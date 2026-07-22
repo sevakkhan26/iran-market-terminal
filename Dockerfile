@@ -5,8 +5,8 @@
 #   2. serves it + the FastAPI API + the continuous background collector
 #      from ONE long-lived process on one port.
 #
-# This image ALWAYS runs the collector (RUN_COLLECTOR=1). It is deliberately not
-# the serverless entrypoint (backend/api/index.py) — that one disables polling.
+# Postgres is a *separate* compose service. This image waits for it, runs
+# Alembic migrations, then starts the app.
 
 # ---------- Stage 1: build the frontend ----------
 FROM node:20-slim AS frontend
@@ -25,38 +25,33 @@ ENV PYTHONUNBUFFERED=1 \
     HOST=0.0.0.0 \
     PORT=4000 \
     RUN_COLLECTOR=1 \
-    TERMINAL_DATA_DIR=/data
+    POSTGRES_HOST=db \
+    POSTGRES_PORT=5432 \
+    POSTGRES_USER=terminal \
+    POSTGRES_PASSWORD=terminal \
+    POSTGRES_DB=terminal
 
 WORKDIR /app/backend
 
-# Python deps first for better layer caching
 COPY backend/requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Backend source + the frontend built in stage 1
 COPY backend/ /app/backend/
 COPY --from=frontend /build/frontend/dist /app/frontend/dist
 
-# Build stamp — so /api/meta and the Admin page show exactly what's deployed.
-# Placed after the source COPY so it refreshes whenever the code changes.
-# Pass a commit with:  docker compose build --build-arg GIT_SHA=$(git rev-parse --short HEAD)
 ARG GIT_SHA=unknown
 ENV APP_GIT_SHA=$GIT_SHA
-RUN date -u +"%Y-%m-%dT%H:%M:%SZ" > /app/backend/.build_time
+RUN date -u +"%Y-%m-%dT%H:%M:%SZ" > /app/backend/.build_time \
+    && chmod +x /app/backend/docker-entrypoint.sh
 
-# Run as a non-root user; a named volume mounted at /data inherits its ownership
 RUN useradd --system --create-home --uid 10001 appuser \
-    && mkdir -p /data \
-    && chown -R appuser:appuser /app /data
+    && chown -R appuser:appuser /app
 USER appuser
 
 EXPOSE 4000
-VOLUME ["/data"]
 
-# The container is "healthy" only while the collector is producing fresh data.
-# /api/health returns 503 when market data is stale.
-HEALTHCHECK --interval=30s --timeout=8s --start-period=90s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=8s --start-period=120s --retries=5 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4000/api/health', timeout=6).status==200 else 1)"
 
-# Long-lived server + supervised background loops + self-restart watchdog.
-CMD ["python", "main.py"]
+# Wait for Postgres → alembic upgrade head → python main.py
+ENTRYPOINT ["./docker-entrypoint.sh"]

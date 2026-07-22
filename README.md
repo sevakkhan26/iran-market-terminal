@@ -1,8 +1,12 @@
-# Iran Market Terminal v2
+# Iran Market Terminal v3
 
 Professional market monitoring platform for Iranian crypto exchanges —
 CoinMarketCap-style overview, TradingView-style charting, and dealing-desk
 alerting in one product.
+
+**Persistence: PostgreSQL only.** Snapshots, candles, users, sessions, alerts,
+settings, and admin config all live in Postgres. There is no SQLite file and no
+`settings.json`.
 
 ## Always start from latest `main` (humans + AIs)
 
@@ -16,67 +20,94 @@ git pull --ff-only origin main
 
 AI agents / coding assistants: read **`AGENTS.md`** first. Rule: **no pull → no code.**
 
-## Quick start
+## Quick start (recommended — Docker Compose)
 
-```bash
-# 1. Backend
-cd backend
-pip install -r requirements.txt
-
-# 2. Frontend (one-time build; all dependencies bundled locally, no CDN)
-cd ../frontend
-npm install
-npm run build
-
-# 3. Run (serves API + UI on http://127.0.0.1:4000)
-cd ../backend
-python3 main.py
-
-# Or try it immediately with synthetic markets (no internet needed):
-DEMO_MODE=1 python3 main.py
-```
-
-Open **http://127.0.0.1:4000**.
-
-## Deploy on a server (Docker) — recommended
-
-This is the supported way to run it on a server. One image builds the frontend
-and runs the API **plus the continuous background collector** in one long-lived
-process. **Do not deploy the serverless entrypoint (`backend/api/index.py`) on a
-server** — that mode disables the collector on purpose, which looks like "the UI
-loads but data never updates."
+One command starts **Postgres + the app**. Migrations run automatically on boot.
 
 ```bash
 git clone https://github.com/sevakkhan26/iran-market-terminal.git
 cd iran-market-terminal
-cp .env.example .env            # optional: set AUTH_* now, or run with defaults first
-docker compose up -d --build    # build + start
-docker compose ps               # STATUS should become "healthy"
-docker compose logs -f          # you should see a "heartbeat" line every ~60s
+git pull --ff-only origin main   # if you already cloned
+cp .env.example .env             # optional: set AUTH_* / POSTGRES_PASSWORD
+docker compose up -d --build
+docker compose ps
+docker compose logs -f terminal
 ```
 
-Open **http://SERVER_IP:4000**.
+Open **http://127.0.0.1:4000** (or `http://SERVER_IP:4000`).
 
-**After every `git pull`, rebuild** — otherwise Docker keeps running the old
-image (the #1 cause of "my fix didn't take effect"):
+Default DB credentials (change in `.env` for real use):
+
+| Var | Default |
+|-----|---------|
+| `POSTGRES_USER` | `terminal` |
+| `POSTGRES_PASSWORD` | `terminal` |
+| `POSTGRES_DB` | `terminal` |
+| `POSTGRES_PORT` | `5432` (host) |
+
+**After every `git pull`:**
 
 ```bash
-git pull && docker compose up -d --build
+git pull --ff-only origin main
+docker compose up -d --build
 ```
+
+That rebuilds the app image and re-applies any new Alembic migrations.
+
+### What runs
+
+| Service | Role |
+|---------|------|
+| `db` | PostgreSQL 16 (volume `pgdata`) |
+| `terminal` | FastAPI + collector + built React UI |
+
+### Local backend without dockerized app
+
+```bash
+# 1. Start only Postgres
+docker compose up -d db
+
+# 2. Backend
+cd backend
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env    # points at 127.0.0.1:5432
+alembic upgrade head
+# optional frontend
+cd ../frontend && npm install && npm run build && cd ../backend
+python3 main.py
+```
+
+Demo markets (no exchange network): `DEMO_MODE=1 python3 main.py`
+
+## Database & migrations
+
+- Driver: **psycopg3** connection pool (`backend/app/db.py`)
+- Schema: **Alembic** under `backend/alembic/versions/`
+- On container start: `docker-entrypoint.sh` waits for Postgres → `alembic upgrade head` → `python main.py`
+- Runtime settings (poll intervals, timeouts, …) are rows in `app_settings` — not a JSON file
+
+Add a schema change:
+
+```bash
+cd backend
+# edit models / write a new file under alembic/versions/
+alembic upgrade head          # apply locally
+# bump APP_VERSION in backend/main.py
+```
+
+## Deploy on a server
+
+Same as quick start. **Do not** deploy the serverless entrypoint
+(`backend/api/index.py`) as the only process on a server — that mode disables
+the collector.
 
 Reliability built in:
 
-- **Always collects.** The image sets `RUN_COLLECTOR=1`; polling can't be
-  silently disabled.
-- **Self-healing.** Each loop is timeout-bounded and auto-restarts; a stuck
-  network/DB call aborts its cycle instead of freezing collection.
-- **Self-restarting.** If market data goes stale for >5 min (process wedged), a
-  watchdog exits and `restart: unless-stopped` brings up a clean container — **no
-  more manual `docker restart`.** Tune with `WATCHDOG_STALE_EXIT_SEC`.
-- **Observable.** `GET /api/health` returns `200` while data is fresh, `503`
-  when stale (drives the Docker health check); logs print a per-loop heartbeat.
-- **Persistent.** The SQLite database lives in the `terminal-data` volume and
-  survives rebuilds/restarts.
+- **Always collects.** The image sets `RUN_COLLECTOR=1`.
+- **Self-healing loops** with timeouts + watchdog restart.
+- **Observable.** `GET /api/health`; Admin diagnostics show Postgres row counts.
+- **Persistent.** All data is in the `pgdata` Docker volume.
 
 Generate the auth secrets once the image is built:
 
@@ -86,33 +117,27 @@ docker compose run --rm terminal python main.py generate-secret
 # paste both into .env, then:  docker compose up -d
 ```
 
-## Authentication (environment-driven, two secrets)
+## Authentication
 
-Single account, configured entirely through environment variables — no
-credentials in code or in the database, no disk writes on login (works on
-read-only/serverless hosting).
+Users and sessions are stored in **PostgreSQL** (`users`, `auth_sessions`).
+Bootstrap the first admin from env (or defaults for local only):
 
 ```bash
-cd backend
-cp .env.example .env
-python3 main.py hash-password "your-strong-password"   # → AUTH_PASSWORD_HASH=…
-python3 main.py generate-secret                        # → AUTH_TOKEN_SECRET=…
-# paste both lines into .env, set AUTH_USERNAME, start the server
+docker compose run --rm terminal python main.py hash-password "your-strong-password"
+docker compose run --rm terminal python main.py generate-secret
+# paste into .env → AUTH_PASSWORD_HASH / AUTH_TOKEN_SECRET, then recreate
+docker compose up -d
 ```
 
 | Variable             | Purpose                                              |
 |----------------------|------------------------------------------------------|
-| `AUTH_USERNAME`      | login username (default `admin`)                     |
-| `AUTH_PASSWORD_HASH` | PBKDF2 hash of the password (secret #1)              |
-| `AUTH_TOKEN_SECRET`  | random token-signing secret (secret #2)              |
+| `AUTH_USERNAME`      | bootstrap admin username (default `admin`)           |
+| `AUTH_PASSWORD_HASH` | PBKDF2 hash for first admin (secret #1)              |
+| `AUTH_TOKEN_SECRET`  | session/token material (secret #2)                   |
 | `AUTH_PASSWORD`      | dev-only plaintext alternative to the hash           |
 
-On **Vercel/hosting**: add the same variables in Settings → Environment
-Variables. Session tokens are HMAC-signed with a key derived from *both*
-secrets, so rotating either one (change the env var + redeploy) instantly
-invalidates all sessions. Without any variables set, the app falls back to
-`admin`/`admin` with a loud startup warning — local development only.
-Never commit `.env` (already in .gitignore).
+Without secrets set, first boot creates `admin`/`admin` (forced password change).
+Never commit `.env`.
 
 ## Development
 
@@ -124,12 +149,13 @@ cd backend  && python3 -m pytest tests/         # unit tests
 
 ## Configuration
 
-- `backend/app_config.json` — enabled exchanges, taker fees, assets, retention,
-  reference-price source, server host/port, admin token.
-- Environment: `DEMO_MODE=1`, `ADMIN_TOKEN=…`, `PORT=…`, `HOST=…`,
-  `TERMINAL_DATA_DIR=…` (SQLite + settings location).
-- Runtime settings (poll intervals, timeouts) are editable in the **Admin** page
-  and persist across restarts.
+- **Postgres:** `DATABASE_URL` or `POSTGRES_HOST` / `USER` / `PASSWORD` / `DB`.
+- `backend/app_config.json` — optional static defaults (exchange list, fees,
+  assets). Runtime Admin changes (pairs, custom exchanges, poll settings) go to
+  Postgres tables / `app_settings`.
+- Environment: `DEMO_MODE=1`, `ADMIN_TOKEN=…`, `PORT=…`, `HOST=…`, `AUTH_*`.
+- Runtime settings (poll intervals, timeouts) are editable in **Admin** and
+  stored in the `app_settings` table.
 
 ## Adding exchanges & pairs — no rebuild
 
@@ -162,22 +188,19 @@ JSON response; `{symbol}` is substituted in URLs and paths.
 ## Architecture (summary)
 
 ```
+docker-compose.yml   Postgres (`db`) + app (`terminal`)
 backend/
-  main.py            FastAPI app, REST + WebSocket, background loops, serves frontend/dist
+  main.py            FastAPI + collector + static UI; runs migrations on start
+  docker-entrypoint.sh  wait for Postgres → alembic upgrade head → main.py
+  alembic/           schema migrations (source of truth)
   app/
-    config.py        app_config.json + env overrides
-    settings.py      runtime-tunable settings (persisted)
-    models.py        dataclasses (snapshots, order books, events, alerts)
-    connectors.py    6 Iranian exchanges (full depth + 24h stats + candles),
-                     GenericRestConnector (JSON-spec), CoinGecko reference, demo generator
-    aggregator.py    poll cycle → metrics → composite index → 5-min snapshots
-    metrics.py       1H/24H/7D change, spread stats, liquidity score, Iran premium,
-                     depth+fee-aware arbitrage, anomaly detection
-    alerts.py        rule engine (8 rule types), cooldowns, persisted events
-    candles.py       native klines + ring-built 60s candles, resampling for 1H–1M
-    news.py          RSS news + ForexFactory calendar, surprise %, DB persistence
-    db.py            SQLite WAL, batched writes, hourly retention pruning
-frontend/            React 18 + Vite, lightweight-charts, EN/FA + RTL, zero runtime CDN
+    config.py        static defaults + optional app_config.json + env
+    settings.py      runtime settings → Postgres app_settings
+    db.py            PostgreSQL pool (psycopg3) — all persistence
+    connectors.py    Iranian exchanges + GenericRest + CoinGecko + demo
+    aggregator.py    poll cycle → metrics → composite → snapshots
+    …
+frontend/            React 18 + Vite, lightweight-charts, EN/FA + RTL
 ```
 
 See `ARCHITECTURE.md` for the full design review and roadmap.

@@ -52,8 +52,14 @@ operators use it to confirm which build is running.
 
 - Backend: FastAPI in `backend/` (collector + API + static UI).
 - Frontend: React/Vite in `frontend/` (build into `frontend/dist`).
-- Server deploy: Docker via parent `docker-compose` / `Dockerfile` — collector must stay enabled (`RUN_COLLECTOR=1`).
-- Do not reintroduce unbounded concurrent exchange fetches (see `MAX_INFLIGHT` in `backend/app/connectors.py`).
+- **Persistence is PostgreSQL only** — no SQLite, no `settings.json`. Schema is
+  managed by Alembic under `backend/alembic/`. After schema changes: add a
+  migration, bump `APP_VERSION`, document it.
+- Local stack: `docker compose up -d --build` (starts `db` + `terminal`, runs
+  `alembic upgrade head` on boot).
+- Server deploy: same compose file; collector must stay enabled (`RUN_COLLECTOR=1`).
+- Do not reintroduce unbounded concurrent exchange fetches (see `MAX_INFLIGHT`
+  in `backend/app/connectors.py`).
 
 ## Rule of thumb
 

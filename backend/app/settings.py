@@ -1,42 +1,43 @@
-"""Thread-safe runtime settings store, persisted to data/settings.json."""
+"""Thread-safe runtime settings store, persisted in Postgres (app_settings)."""
 from __future__ import annotations
 
-import json
 import logging
 import threading
 from dataclasses import asdict, fields
-from pathlib import Path
 from typing import Any, Dict
 
-from .db import DATA_DIR
+from . import db
 from .models import AppSettings
 
 log = logging.getLogger("terminal.settings")
-
-SETTINGS_PATH = DATA_DIR / "settings.json"
 
 
 class SettingsStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._settings = AppSettings()
-        self._load()
+        self._loaded = False
 
-    def _load(self) -> None:
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
         try:
-            if SETTINGS_PATH.exists():
-                data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            data = db.get_app_settings()
+            if data:
                 self._apply(data)
+                log.info("Loaded %d settings from Postgres", len(data))
         except Exception as exc:
-            log.warning("Could not load persisted settings: %s", exc)
+            log.warning("Could not load settings from DB yet (%s) — using defaults",
+                        exc)
+        self._loaded = True
 
     def _persist(self) -> None:
         try:
-            SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            SETTINGS_PATH.write_text(json.dumps(asdict(self._settings), indent=2),
-                                     encoding="utf-8")
+            payload = {f.name: float(getattr(self._settings, f.name))
+                       for f in fields(AppSettings)}
+            db.set_app_settings(payload)
         except Exception as exc:
-            log.warning("Could not persist settings: %s", exc)
+            log.warning("Could not persist settings to DB: %s", exc)
 
     def _apply(self, data: Dict[str, Any]) -> None:
         valid = {f.name for f in fields(AppSettings)}
@@ -54,11 +55,13 @@ class SettingsStore:
 
     def get(self) -> AppSettings:
         with self._lock:
+            self._ensure_loaded()
             return AppSettings(**{f.name: getattr(self._settings, f.name)
                                   for f in fields(AppSettings)})
 
     def update(self, data: Dict[str, Any]) -> AppSettings:
         with self._lock:
+            self._ensure_loaded()
             self._apply(data)
             self._persist()
             return self.get_unlocked()
