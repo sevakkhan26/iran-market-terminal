@@ -65,6 +65,9 @@ services:
       AUTH_TOKEN_SECRET: "${AUTH_TOKEN_SECRET:-}"
       AUTH_PASSWORD: "${AUTH_PASSWORD:-}"
       ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
+      # Set to 1 when publicapi.ramzinex.com is TCP-blocked on the host network
+      RAMZINEX_DISABLE: "${RAMZINEX_DISABLE:-}"
+      RAMZINEX_API_BASE: "${RAMZINEX_API_BASE:-}"
       # All persistence → Postgres (no SQLite / settings.json)
       POSTGRES_HOST: db
       POSTGRES_PORT: "5432"
