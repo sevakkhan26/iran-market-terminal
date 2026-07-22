@@ -18,7 +18,9 @@ git checkout main
 git pull --ff-only origin main
 ```
 
-AI agents / coding assistants: read **`AGENTS.md`** first. Rule: **no pull → no code.**
+AI agents / coding assistants: read **`docs/AGENT_PLAYBOOK.md`** first
+(then `AGENTS.md`). Rule: **no pull → no code.** That playbook is the full
+checklist so another machine’s agent can bring the stack up after `git pull`.
 
 ## Quick start (recommended — Docker Compose)
 

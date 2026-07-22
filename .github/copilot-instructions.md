@@ -1,11 +1,14 @@
 # GitHub Copilot instructions
 
-This repo is multi-contributor. **Always sync before editing:**
+Primary setup/ops guide for this multi-agent repo:
 
-```bash
-git fetch origin && git checkout main && git pull --ff-only origin main
-```
+→ **docs/AGENT_PLAYBOOK.md**
 
-Never implement features or fixes on a stale branch. Prefer `origin/main` as the only base.
+Always:
+1. `git pull --ff-only origin main` before edits
+2. Use Docker Compose (`db` + `terminal`); Postgres only
+3. Migrations: Alembic, auto on container start
+4. Offline build helper: `scripts/prepare-offline-build.sh`
+5. Bump `APP_VERSION` on product changes
 
-Full rules: see root `AGENTS.md`.
+Do not reintroduce SQLite or file-based runtime settings.

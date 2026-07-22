@@ -1,11 +1,14 @@
-# Cursor rules — iran-market-terminal
+# Cursor — iran-market-terminal
 
-MANDATORY at session start and before any edit/build/deploy:
+PRIMARY DOC: docs/AGENT_PLAYBOOK.md  (read fully at session start)
 
-```bash
-git fetch origin && git checkout main && git pull --ff-only origin main
-```
+MANDATORY every session / before any edit:
+  git fetch origin && git checkout main && git pull --ff-only origin main
 
-If pull fails, stop and show git status. Do not code on an outdated checkout.
+Stack:
+  docker compose up -d --build
+  Postgres only (Alembic migrations auto on start)
+  If build DNS fails: ./scripts/prepare-offline-build.sh
 
-Details: AGENTS.md
+Also: AGENTS.md, docs/DATABASE.md, README.md
+Bump APP_VERSION on product changes.

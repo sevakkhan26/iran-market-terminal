@@ -1,12 +1,16 @@
 # Agent / AI instructions (MANDATORY)
 
-This repository is actively developed by multiple people and AIs.
-**Stale checkouts cause wasted work and broken deploys.**
+**Full setup + ops playbook:** [`docs/AGENT_PLAYBOOK.md`](docs/AGENT_PLAYBOOK.md)
 
-## Before ANY work — always do this first
+Read **`docs/AGENT_PLAYBOOK.md` first** on every session. That file has the complete
+checklist: pull, Docker Compose, Postgres, offline builds, migrations, exchange
+quirks, version bumps, and verification.
 
-1. Confirm you are in the project root of `iran-market-terminal`.
-2. **Sync with GitHub before reading or editing anything:**
+This file is only a short gate.
+
+---
+
+## Before ANY work
 
 ```bash
 git fetch origin
@@ -14,54 +18,26 @@ git checkout main
 git pull --ff-only origin main
 ```
 
-3. If `git pull --ff-only` fails (local commits / dirty tree):
-   - Show `git status` and `git log --oneline -5` to the user.
-   - Do **not** invent a parallel fix on top of an old base.
-   - Prefer: stash or commit local work, then `git pull --rebase origin main` (only with user approval if history rewrite is involved).
+**No pull → no code.**
 
-4. Only **after** a successful pull may you:
-   - read the codebase
-   - change files
-   - run builds / tests
-   - deploy
-
-## If the user says "continue" or "fix X"
-
-Still run `git pull --ff-only origin main` first. Do not assume your previous session is up to date.
-
-## After you finish a change
+## Bring the stack up (after pull)
 
 ```bash
-git status
-git pull --ff-only origin main   # again, in case something landed while you worked
-# then commit + push as the user requested
+cp -n .env.example .env
+# if docker build fails DNS:
+#   ./scripts/prepare-offline-build.sh
+docker compose up -d --build
+curl -s http://127.0.0.1:4000/api/health
 ```
 
-## ALWAYS bump the app version with every change
+Postgres + Alembic migrations run automatically on container start.
 
-`APP_VERSION` in `backend/main.py` is shown in the Admin UI and `/api/meta`.
-**Every commit that changes product behavior, UI, or deploy must bump it**
-(semver: patch for fixes, minor for features).
+## Always
 
-Also keep `frontend/package.json` `"version"` in sync when you touch the app.
-
-Do **not** leave the version sticky across unrelated PRs — reviewers and
-operators use it to confirm which build is running.
-
-## Project notes (short)
-
-- Backend: FastAPI in `backend/` (collector + API + static UI).
-- Frontend: React/Vite in `frontend/` (build into `frontend/dist`).
-- **Persistence is PostgreSQL only** — no SQLite, no `settings.json`. Schema is
-  managed by Alembic under `backend/alembic/`. After schema changes: add a
-  migration, bump `APP_VERSION`, document it.
-- Local stack: `docker compose up -d --build` (starts `db` + `terminal`, runs
-  `alembic upgrade head` on boot).
-- Server deploy: same compose file; collector must stay enabled (`RUN_COLLECTOR=1`).
-- Do not reintroduce unbounded concurrent exchange fetches (see `MAX_INFLIGHT`
-  in `backend/app/connectors.py` and circuit breakers in `circuit_breaker.py`).
-- Prefer `docker compose up -d --build` after pull; migrations auto-run.
+- **PostgreSQL only** (no SQLite / settings.json for runtime data)
+- **Bump `APP_VERSION`** in `backend/main.py` (+ `frontend/package.json`) on product changes
+- Do not unbounded-fanout exchange polls (`MAX_INFLIGHT` + circuit breakers)
 
 ## Rule of thumb
 
-**No pull → no code.** Always start from latest `origin/main`.
+Pull → Compose up → Verify health → Then code.
