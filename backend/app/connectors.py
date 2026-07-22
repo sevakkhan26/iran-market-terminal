@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import random
 import time
 from typing import Any, Dict, List, Optional
@@ -599,24 +600,50 @@ class TabdealConnector(BaseExchangeConnector):
 class RamzinexConnector(BaseExchangeConnector):
     exchange_name = "Ramzinex"
     supports_trades = True
-    BASE_URL = "https://publicapi.ramzinex.com"
+    # publicapi often times out on some ISP/CDN edges — try multiple bases.
+    BASE_URLS = (
+        os.environ.get("RAMZINEX_API_BASE", "").strip() or None,
+        "https://publicapi.ramzinex.com",
+        "https://api.ramzinex.com",
+    )
     RIAL_SCALE = 0.1
-    # Ramzinex identifies markets by numeric pair id (IRR-quoted).
-    # Only these three are known stable public IDs — other assets must not be
-    # polled (they raise UnsupportedPair and used to spam the error log).
-    PAIR_IDS: Dict[str, int] = {"BTC": 2, "ETH": 3, "USDT": 11}
+    # Numeric pair ids (IRR-quoted) for markets we poll.
+    PAIR_IDS: Dict[str, int] = {
+        "BTC": 2, "ETH": 3, "USDT": 11,
+        # common extras (best-effort; unknown ids are skipped via supports_pair)
+        "XRP": 9, "LTC": 4, "BNB": 13,
+    }
 
     def supports_pair(self, base: str) -> bool:
         return base.upper() in self.PAIR_IDS
+
+    def _bases(self) -> List[str]:
+        return [b for b in self.BASE_URLS if b]
+
+    async def _get_json(self, path: str, timeout: float = 25.0) -> Any:
+        last_exc: Optional[Exception] = None
+        client = get_client(timeout=timeout)
+        for base in self._bases():
+            url = f"{base.rstrip('/')}{path}"
+            for attempt in range(2):
+                try:
+                    r = await client.get(url)
+                    r.raise_for_status()
+                    return r.json()
+                except Exception as exc:
+                    last_exc = exc
+                    await asyncio.sleep(0.5 * (attempt + 1))
+        raise last_exc if last_exc else RuntimeError(f"Ramzinex failed: {path}")
 
     async def fetch_trades(self, base: str) -> List[Dict[str, Any]]:
         pair_id = self.PAIR_IDS.get(base.upper())
         if pair_id is None:
             return []
-        r = await get_client().get(
-            f"{self.BASE_URL}/exchange/api/v1.0/exchange/trades/{pair_id}")
-        r.raise_for_status()
-        payload = r.json()
+        try:
+            payload = await self._get_json(
+                f"/exchange/api/v1.0/exchange/trades/{pair_id}")
+        except Exception:
+            return []
         raw = payload.get("data", payload) if isinstance(payload, dict) else payload
         return _normalize_trades(raw, self.RIAL_SCALE)
 
@@ -624,33 +651,28 @@ class RamzinexConnector(BaseExchangeConnector):
         pair_id = self.PAIR_IDS.get(base.upper())
         if pair_id is None:
             raise UnsupportedPair(f"Ramzinex: unknown pair for {base}")
-        url = (f"{self.BASE_URL}/exchange/api/v1.0/exchange/"
-               f"orderbooks/{pair_id}/buys_sells")
-        # Ramzinex is often slow/timeout-prone from some networks — retry.
-        last_exc: Optional[Exception] = None
-        for attempt in range(3):
-            try:
-                r = await get_client(timeout=20.0).get(url)
-                r.raise_for_status()
-                data = r.json().get("data", {})
-                bids = _normalize_levels(data.get("buys"), self.RIAL_SCALE,
-                                         descending=True)
-                asks = _normalize_levels(data.get("sells"), self.RIAL_SCALE)
-                return self._book(bids, asks)
-            except Exception as exc:
-                last_exc = exc
-                await asyncio.sleep(0.4 * (attempt + 1))
-        raise last_exc if last_exc else RuntimeError("Ramzinex order book failed")
+        data = await self._get_json(
+            f"/exchange/api/v1.0/exchange/orderbooks/{pair_id}/buys_sells",
+            timeout=30.0)
+        book = data.get("data", data) if isinstance(data, dict) else {}
+        if not isinstance(book, dict):
+            book = {}
+        bids = _normalize_levels(book.get("buys"), self.RIAL_SCALE, descending=True)
+        asks = _normalize_levels(book.get("sells"), self.RIAL_SCALE)
+        if not bids or not asks:
+            raise ValueError("Ramzinex empty book")
+        return self._book(bids, asks)
 
     async def fetch_stats(self, base: str) -> TickerStats:
-        """24h stats from the pair details endpoint (financial.last24h)."""
         pair_id = self.PAIR_IDS.get(base.upper())
         if pair_id is None:
             return TickerStats()
-        r = await get_client().get(
-            f"{self.BASE_URL}/exchange/api/v1.0/exchange/pairs/{pair_id}")
-        r.raise_for_status()
-        data = r.json().get("data", {})
+        try:
+            data = await self._get_json(
+                f"/exchange/api/v1.0/exchange/pairs/{pair_id}")
+        except Exception:
+            return TickerStats()
+        data = data.get("data", data) if isinstance(data, dict) else {}
         if isinstance(data, list):
             data = data[0] if data else {}
         pair = data.get("pair", data) if isinstance(data, dict) else {}

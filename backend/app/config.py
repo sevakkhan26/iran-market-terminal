@@ -20,19 +20,31 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "app_config.json"
 
 _DEFAULTS: Dict[str, Any] = {
     "quote_currency": "TMN",
-    "assets": ["BTC", "ETH", "USDT"],
+    "assets": [
+        "BTC", "ETH", "USDT", "TRX", "SOL", "GRAM", "BNB", "XRP",
+        "ADA", "LTC", "LINK", "SUI", "XLM", "AVAX", "NEAR", "UNI", "AAVE", "DOT",
+    ],
     "exchanges": {
         "Nobitex": {"enabled": True, "taker_fee_pct": 0.25, "color": "#4A9EFF"},
         "Wallex": {"enabled": True, "taker_fee_pct": 0.25, "color": "#9C6BFF"},
         "Bitpin": {"enabled": True, "taker_fee_pct": 0.30, "color": "#00D68F"},
         "Exir": {"enabled": True, "taker_fee_pct": 0.20, "color": "#FFB020"},
         "Tabdeal": {"enabled": True, "taker_fee_pct": 0.25, "color": "#FF6B9D"},
+        # publicapi.ramzinex.com is often TCP-blocked on some hosts; enable via
+        # app_config or env RAMZINEX_FORCE=1 when reachable.
         "Ramzinex": {"enabled": True, "taker_fee_pct": 0.35, "color": "#38C6D9"},
     },
     "reference": {
         "enabled": True,
         "provider": "coingecko",
-        "coingecko_ids": {"BTC": "bitcoin", "ETH": "ethereum", "USDT": "tether"},
+        "coingecko_ids": {
+            "BTC": "bitcoin", "ETH": "ethereum", "USDT": "tether",
+            "TRX": "tron", "SOL": "solana", "GRAM": "gram", "BNB": "binancecoin",
+            "XRP": "ripple", "ADA": "cardano", "LTC": "litecoin",
+            "LINK": "chainlink", "SUI": "sui", "XLM": "stellar",
+            "AVAX": "avalanche-2", "NEAR": "near", "UNI": "uniswap",
+            "AAVE": "aave", "DOT": "polkadot",
+        },
     },
     "retention": {"snapshots_days": 90, "candles_days": 365,
                   "alerts_days": 30, "calendar_days": 730},
@@ -66,6 +78,11 @@ def load_config() -> Dict[str, Any]:
         cfg["server"]["port"] = int(os.environ["PORT"])
     if os.environ.get("HOST"):
         cfg["server"]["host"] = os.environ["HOST"]
+    # Some hosts cannot reach Ramzinex CDN (TCP timeout). Disable with env.
+    if os.environ.get("RAMZINEX_DISABLE", "").lower() in ("1", "true", "yes"):
+        cfg.setdefault("exchanges", {}).setdefault("Ramzinex", {})["enabled"] = False
+    if os.environ.get("RAMZINEX_FORCE", "").lower() in ("1", "true", "yes"):
+        cfg.setdefault("exchanges", {}).setdefault("Ramzinex", {})["enabled"] = True
     return cfg
 
 

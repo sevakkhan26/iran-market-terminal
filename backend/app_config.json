@@ -1,6 +1,9 @@
 {
   "quote_currency": "TMN",
-  "assets": ["BTC", "ETH", "USDT"],
+  "assets": [
+    "BTC", "ETH", "USDT", "TRX", "SOL", "GRAM", "BNB", "XRP",
+    "ADA", "LTC", "LINK", "SUI", "XLM", "AVAX", "NEAR", "UNI", "AAVE", "DOT"
+  ],
   "exchanges": {
     "Nobitex":  { "enabled": true,  "taker_fee_pct": 0.25, "color": "#4A9EFF" },
     "Wallex":   { "enabled": true,  "taker_fee_pct": 0.25, "color": "#9C6BFF" },
@@ -12,7 +15,26 @@
   "reference": {
     "enabled": true,
     "provider": "coingecko",
-    "coingecko_ids": { "BTC": "bitcoin", "ETH": "ethereum", "USDT": "tether" }
+    "coingecko_ids": {
+      "BTC": "bitcoin",
+      "ETH": "ethereum",
+      "USDT": "tether",
+      "TRX": "tron",
+      "SOL": "solana",
+      "GRAM": "gram",
+      "BNB": "binancecoin",
+      "XRP": "ripple",
+      "ADA": "cardano",
+      "LTC": "litecoin",
+      "LINK": "chainlink",
+      "SUI": "sui",
+      "XLM": "stellar",
+      "AVAX": "avalanche-2",
+      "NEAR": "near",
+      "UNI": "uniswap",
+      "AAVE": "aave",
+      "DOT": "polkadot"
+    }
   },
   "retention": {
     "snapshots_days": 90,
