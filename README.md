@@ -4,6 +4,18 @@ Professional market monitoring platform for Iranian crypto exchanges —
 CoinMarketCap-style overview, TradingView-style charting, and dealing-desk
 alerting in one product.
 
+## Always start from latest `main` (humans + AIs)
+
+This project is shared. **Before any work**, sync with GitHub:
+
+```bash
+git fetch origin
+git checkout main
+git pull --ff-only origin main
+```
+
+AI agents / coding assistants: read **`AGENTS.md`** first. Rule: **no pull → no code.**
+
 ## Quick start
 
 ```bash

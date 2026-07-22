@@ -1,0 +1,11 @@
+# Cursor rules — iran-market-terminal
+
+MANDATORY at session start and before any edit/build/deploy:
+
+```bash
+git fetch origin && git checkout main && git pull --ff-only origin main
+```
+
+If pull fails, stop and show git status. Do not code on an outdated checkout.
+
+Details: AGENTS.md
