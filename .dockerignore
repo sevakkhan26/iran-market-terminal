@@ -1,31 +1,12 @@
-# Keep the build context small and never ship secrets / local state.
 .git
-.gitignore
 .github
-README.md
-ARCHITECTURE.md
-vercel.json
-backend/api
-
-# Python
 **/__pycache__/
 **/*.pyc
 .pytest_cache/
 venv/
 .venv/
-*.egg-info/
-
-# Node / frontend (rebuilt inside the image)
 **/node_modules/
-frontend/dist/
-
-# Local data & secrets (must never enter the image)
 backend/data/
-data/
 **/.env
 *.db
-*.sqlite
-*.sqlite3
-
-# OS noise
 .DS_Store

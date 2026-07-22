@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
-# Prepare wheelhouse + frontend/dist on the HOST (where DNS works), so
-# `docker compose build` can install without PyPI/npm network access.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
-
-echo "==> Downloading Python wheels → backend/wheelhouse"
 mkdir -p backend/wheelhouse
-python3 -m pip download -r backend/requirements.txt -d backend/wheelhouse
 
-echo "==> Building frontend → frontend/dist"
-cd frontend
-if [ -f package-lock.json ]; then
-  npm install --no-audit --no-fund
+echo "==> Python wheels (use docker --dns if host pip lacks network inside containers)"
+if command -v docker >/dev/null 2>&1; then
+  docker run --rm --dns 8.8.8.8 --dns 1.1.1.1 \
+    -v "$ROOT/backend/requirements.txt:/req.txt:ro" \
+    -v "$ROOT/backend/wheelhouse:/wheels" \
+    python:3.12-slim bash -c \
+    "pip install -U pip && pip download -r /req.txt -d /wheels && pip download setuptools wheel -d /wheels"
 else
-  npm install --no-audit --no-fund
+  python3 -m pip download -r backend/requirements.txt -d backend/wheelhouse
+  python3 -m pip download setuptools wheel -d backend/wheelhouse
 fi
+
+echo "==> Frontend build"
+cd frontend
+npm install --no-audit --no-fund
 npm run build
 cd "$ROOT"
-
-echo "==> Ready. Build with:"
-echo "    docker compose build && docker compose up -d"
-echo "    # or: docker build --build-arg GIT_SHA=\$(git rev-parse --short HEAD) -t iran-market-terminal:latest ."
+test -f frontend/dist/index.html
+echo "OK — docker compose build && docker compose up -d"
