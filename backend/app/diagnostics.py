@@ -106,10 +106,11 @@ def environment_report(aggregator, news_service) -> Dict[str, Any]:
     preferred_dir = os.environ.get("TERMINAL_DATA_DIR") or "backend/data"
     using_fallback = "terminal-data" in str(db.DATA_DIR) and "tmp" in str(db.DATA_DIR).lower()
 
-    # market feed freshness
+    # market feed freshness — only slots we actually poll (unsupported pairs
+    # are never stored, so they no longer inflate the denominator with red chips)
     snaps = list(aggregator.market_state.values())
     live = [s for s in snaps if s.mid > 0 and s.status != "offline"]
-    newest = max((s.timestamp for s in snaps), default=0)
+    newest = max((s.timestamp for s in live or snaps), default=0)
     feed_age = round(now - newest, 1) if newest else None
 
     frontend_dist = None
@@ -155,7 +156,7 @@ def environment_report(aggregator, news_service) -> Dict[str, Any]:
                 else "frontend/dist MISSING — run: cd frontend && npm run build"),
             "market_feed": check(
                 len(live) > 0 and feed_age is not None and feed_age < 60,
-                f"{len(live)}/{len(snaps)} venue-feeds live, newest data {feed_age}s old"
+                f"{len(live)}/{len(snaps)} polled venue-feeds live, newest data {feed_age}s old"
                 if snaps else "NO market data at all — run the connectivity test"),
             "connectors_active": check(
                 len(aggregator.connectors) > 0,
@@ -168,11 +169,19 @@ def environment_report(aggregator, news_service) -> Dict[str, Any]:
                 len(news_service.calendar_cache) > 0,
                 f"{len(news_service.calendar_cache)} events cached"),
         },
-        "venues": [{
-            "exchange": s.exchange, "base": s.base, "status": s.status,
-            "age_sec": round(now - s.timestamp, 1) if s.timestamp else None,
-            "latency_ms": s.latency_ms,
-        } for s in snaps],
+        # Sort live first so Admin chips read green→amber→red
+        "venues": sorted(
+            [{
+                "exchange": s.exchange, "base": s.base, "status": s.status,
+                "age_sec": round(now - s.timestamp, 1) if s.timestamp else None,
+                "latency_ms": s.latency_ms,
+            } for s in snaps],
+            key=lambda v: (
+                0 if v["status"] == "connected" else
+                1 if v["status"] == "delayed" else 2,
+                v["exchange"], v["base"],
+            ),
+        ),
     }
 
 

@@ -37,6 +37,11 @@ SOFT_FAIL_GRACE_SEC = 90.0
 _GLOBAL_SEM: Optional[asyncio.Semaphore] = None
 _EX_SEMS: Dict[str, asyncio.Semaphore] = {}
 PER_EXCHANGE_INFLIGHT = 4
+# Venues that 429 or time out under parallelism get a tighter slot budget.
+EXCHANGE_INFLIGHT = {
+    "Exir": 1,
+    "Ramzinex": 2,
+}
 
 
 def _global_sem() -> asyncio.Semaphore:
@@ -49,7 +54,8 @@ def _global_sem() -> asyncio.Semaphore:
 def _ex_sem(name: str) -> asyncio.Semaphore:
     sem = _EX_SEMS.get(name)
     if sem is None:
-        sem = asyncio.Semaphore(PER_EXCHANGE_INFLIGHT)
+        n = EXCHANGE_INFLIGHT.get(name, PER_EXCHANGE_INFLIGHT)
+        sem = asyncio.Semaphore(n)
         _EX_SEMS[name] = sem
     return sem
 
@@ -94,6 +100,14 @@ class MarketAggregator:
         maybe_recycle_client()   # shed leaks if client aged out
         settings = settings_store.get()
         pairs = self.pairs()
+        # Drop unsupported venue×pair slots so Admin no longer shows fake reds
+        # left over from older builds that stored offline placeholders.
+        for connector in self.connectors:
+            for base, _q in pairs:
+                if not connector.supports_pair(base):
+                    key = (connector.exchange_name, base)
+                    self.market_state.pop(key, None)
+                    self.books.pop(key, None)
         # Stats/trades are expensive (extra RTT per pair). Refresh at most a
         # rotating subset each minute so we never double the concurrent load.
         refresh_stats = time.time() - self.last_stats_refresh > 90
@@ -136,26 +150,34 @@ class MarketAggregator:
                        timeout: float, refresh_stats: bool) -> None:
         key = (connector.exchange_name, base)
 
-        # Skip known-unsupported pairs and rate-limited venues cheaply.
+        # Skip known-unsupported pairs — do NOT leave offline chips in Admin.
         if not connector.supports_pair(base):
-            self._mark_unsupported(key, connector.exchange_name, base, quote)
+            self.market_state.pop(key, None)
+            self.books.pop(key, None)
             return
         if is_rate_limited(connector.exchange_name):
             self._soft_fail(key, connector.exchange_name, base, quote,
                             RateLimited(f"{connector.exchange_name} cooldown"))
             return
 
+        # Slow venues get a longer wait_for budget (retries live in the connector).
+        eff_timeout = timeout
+        if connector.exchange_name == "Ramzinex":
+            eff_timeout = max(timeout, 22.0)
+        elif connector.exchange_name == "Exir":
+            eff_timeout = max(timeout, 15.0)
+
         started = time.time()
         try:
             async with _global_sem():
                 async with _ex_sem(connector.exchange_name):
                     book = await asyncio.wait_for(
-                        connector.fetch_order_book(base), timeout=timeout)
+                        connector.fetch_order_book(base), timeout=eff_timeout)
                     latency_ms = (time.time() - started) * 1000
                     if refresh_stats:
                         try:
                             stats_result = await asyncio.wait_for(
-                                connector.fetch_stats(base), timeout=timeout)
+                                connector.fetch_stats(base), timeout=eff_timeout)
                             self.stats_cache[key] = stats_result
                             if (not stats_result.volume_24h_base
                                     and not stats_result.volume_24h_quote
@@ -177,7 +199,7 @@ class MarketAggregator:
                                 and not cached.volume_24h_quote):
                             try:
                                 trades = await asyncio.wait_for(
-                                    connector.fetch_trades(base), timeout=timeout)
+                                    connector.fetch_trades(base), timeout=eff_timeout)
                                 volume_estimator.ingest(
                                     connector.exchange_name, base, trades)
                             except Exception as exc:
@@ -222,20 +244,10 @@ class MarketAggregator:
             self.market_state[key] = snap
             metrics_engine.ingest(snap)
         except UnsupportedPair:
-            self._mark_unsupported(key, connector.exchange_name, base, quote)
+            self.market_state.pop(key, None)
+            self.books.pop(key, None)
         except Exception as exc:
             self._soft_fail(key, connector.exchange_name, base, quote, exc)
-
-    def _mark_unsupported(self, key: Tuple[str, str], exchange: str,
-                          base: str, quote: str) -> None:
-        """Pair not listed on venue — quiet offline, no log spam."""
-        prev = self.market_state.get(key)
-        if prev and prev.mid > 0:
-            prev.status = MarketStatus.OFFLINE.value
-            return
-        self.market_state[key] = MarketSnapshot(
-            exchange=exchange, base=base, quote=quote,
-            status=MarketStatus.OFFLINE.value, timestamp=0.0)
 
     def _soft_fail(self, key: Tuple[str, str], exchange: str,
                    base: str, quote: str, exc: Exception) -> None:

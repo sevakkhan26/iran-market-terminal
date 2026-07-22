@@ -14,4 +14,7 @@ If pull fails, stop and report `git status` to the user — do not keep coding o
 
 Same rule when the user says "continue", "fix", or "resume": pull first.
 
+**Bump `APP_VERSION` in `backend/main.py` (and `frontend/package.json`) on every
+user-facing change** so Admin shows the new build.
+
 See `AGENTS.md` for full workflow.

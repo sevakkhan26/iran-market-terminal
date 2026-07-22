@@ -37,6 +37,17 @@ git pull --ff-only origin main   # again, in case something landed while you wor
 # then commit + push as the user requested
 ```
 
+## ALWAYS bump the app version with every change
+
+`APP_VERSION` in `backend/main.py` is shown in the Admin UI and `/api/meta`.
+**Every commit that changes product behavior, UI, or deploy must bump it**
+(semver: patch for fixes, minor for features).
+
+Also keep `frontend/package.json` `"version"` in sync when you touch the app.
+
+Do **not** leave the version sticky across unrelated PRs — reviewers and
+operators use it to confirm which build is running.
+
 ## Project notes (short)
 
 - Backend: FastAPI in `backend/` (collector + API + static UI).

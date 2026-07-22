@@ -72,8 +72,8 @@ def get_client(timeout: float = 12.0) -> httpx.AsyncClient:
                 asyncio.get_running_loop().create_task(_aclose_later(_client, 2.0))
             except RuntimeError:
                 pass
-        # connect/pool short; read gets the full request budget
-        t = httpx.Timeout(connect=5.0, read=timeout, write=10.0, pool=8.0)
+        # connect a bit generous for flaky IR routes; read gets the request budget
+        t = httpx.Timeout(connect=10.0, read=timeout, write=10.0, pool=10.0)
         _client = httpx.AsyncClient(timeout=t, headers=HEADERS,
                                     follow_redirects=True, limits=_LIMITS)
         _client_ts = time.time()
@@ -107,8 +107,10 @@ def is_rate_limited(exchange: str) -> bool:
 
 
 def mark_rate_limited(exchange: str, seconds: float = 45.0) -> None:
-    _rate_limited_until[exchange] = time.time() + max(5.0, seconds)
-    log.warning("%s rate-limited — cooling down %.0fs", exchange, seconds)
+    # Do not shorten an existing longer cooldown.
+    until = time.time() + max(5.0, seconds)
+    _rate_limited_until[exchange] = max(_rate_limited_until.get(exchange, 0.0), until)
+    log.warning("%s rate-limited — cooling down until +%.0fs", exchange, seconds)
 
 
 async def _aclose_later(client: httpx.AsyncClient, delay: float = 10.0) -> None:
@@ -134,8 +136,10 @@ async def request_get(url: str, *, exchange: str = "",
     client = get_client(timeout if timeout is not None else _client_timeout)
     r = await client.get(url, **kwargs)
     if r.status_code == 429:
+        # Exir in particular needs a long quiet window or every cycle re-trips 429.
+        cool = 180.0 if exchange == "Exir" else 90.0
         if exchange:
-            mark_rate_limited(exchange, 60.0)
+            mark_rate_limited(exchange, cool)
         raise RateLimited(f"{exchange or url}: HTTP 429")
     return r
 
@@ -462,9 +466,9 @@ class ExirConnector(BaseExchangeConnector):
     exchange_name = "Exir"
     supports_candles = True
     BASE_URL = "https://api.exir.io"
-    # Exir rate-limits aggressively when hit with 18 pairs every cycle.
-    # Only poll majors here; the rest thrash into 429 and poison the pool.
-    SUPPORTED = {"BTC", "ETH", "USDT", "TRX", "SOL", "BNB", "XRP", "ADA"}
+    # Exir 429s hard under multi-pair fan-out. Poll only the three desk majors
+    # and keep per-exchange concurrency at 1 (see EXCHANGE_INFLIGHT).
+    SUPPORTED = {"BTC", "ETH", "USDT"}
 
     def _symbol(self, base: str) -> str:
         return f"{base.lower()}-irt"
@@ -484,6 +488,8 @@ class ExirConnector(BaseExchangeConnector):
         book = r.json().get(sym, {})
         bids = _normalize_levels(book.get("bids"), descending=True)
         asks = _normalize_levels(book.get("asks"))
+        # Tiny pause so back-to-back Exir calls in one cycle do not trip 429.
+        await asyncio.sleep(0.35)
         return self._book(bids, asks)
 
     async def fetch_stats(self, base: str) -> TickerStats:
@@ -618,13 +624,23 @@ class RamzinexConnector(BaseExchangeConnector):
         pair_id = self.PAIR_IDS.get(base.upper())
         if pair_id is None:
             raise UnsupportedPair(f"Ramzinex: unknown pair for {base}")
-        r = await get_client().get(
-            f"{self.BASE_URL}/exchange/api/v1.0/exchange/orderbooks/{pair_id}/buys_sells")
-        r.raise_for_status()
-        data = r.json().get("data", {})
-        bids = _normalize_levels(data.get("buys"), self.RIAL_SCALE, descending=True)
-        asks = _normalize_levels(data.get("sells"), self.RIAL_SCALE)
-        return self._book(bids, asks)
+        url = (f"{self.BASE_URL}/exchange/api/v1.0/exchange/"
+               f"orderbooks/{pair_id}/buys_sells")
+        # Ramzinex is often slow/timeout-prone from some networks — retry.
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                r = await get_client(timeout=20.0).get(url)
+                r.raise_for_status()
+                data = r.json().get("data", {})
+                bids = _normalize_levels(data.get("buys"), self.RIAL_SCALE,
+                                         descending=True)
+                asks = _normalize_levels(data.get("sells"), self.RIAL_SCALE)
+                return self._book(bids, asks)
+            except Exception as exc:
+                last_exc = exc
+                await asyncio.sleep(0.4 * (attempt + 1))
+        raise last_exc if last_exc else RuntimeError("Ramzinex order book failed")
 
     async def fetch_stats(self, base: str) -> TickerStats:
         """24h stats from the pair details endpoint (financial.last24h)."""
