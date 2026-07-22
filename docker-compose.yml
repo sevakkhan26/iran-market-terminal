@@ -35,10 +35,10 @@ services:
       start_period: 10s
 
   terminal:
+    # Prefer offline-friendly build: host runs ./scripts/prepare-offline-build.sh
+    # (downloads wheels + builds frontend) then: docker compose build
     build:
       context: .
-      # Host network during build so pip/npm resolve DNS on flaky Docker setups
-      network: host
       args:
         GIT_SHA: "${GIT_SHA:-unknown}"
     image: iran-market-terminal:latest

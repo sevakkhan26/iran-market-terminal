@@ -29,6 +29,10 @@ git clone https://github.com/sevakkhan26/iran-market-terminal.git
 cd iran-market-terminal
 git pull --ff-only origin main   # if you already cloned
 cp .env.example .env             # optional: set AUTH_* / POSTGRES_PASSWORD
+
+# Host network for wheels/npm (recommended when Docker DNS is broken):
+./scripts/prepare-offline-build.sh
+
 docker compose up -d --build
 docker compose ps
 docker compose logs -f terminal

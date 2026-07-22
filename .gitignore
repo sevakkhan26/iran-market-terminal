@@ -5,7 +5,10 @@ __pycache__/
 
 backend/data/
 .pytest_cache/
+backend/wheelhouse/*
+!backend/wheelhouse/.gitkeep
 
 node_modules/
-dist/
+# Prebuilt UI for offline docker builds (created by scripts/prepare-offline-build.sh)
+frontend/dist/
 
