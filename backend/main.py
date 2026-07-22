@@ -297,13 +297,15 @@ async def lifespan(app: FastAPI):
     else:
         log.info("COLLECTOR ENABLED — starting supervised background loops")
         try:  # prime state once so the first requests aren't empty (bounded)
-            await asyncio.wait_for(market_aggregator.update_markets(), timeout=40)
+            await asyncio.wait_for(market_aggregator.update_markets(), timeout=120)
         except Exception as exc:
             log.warning("initial market poll failed (will retry in loop): %s", exc)
+        # Market cycle can take ~30-60s under semaphore + slow venues; give it room
+        # so wait_for does not abort a healthy but slow poll (which leaks sockets).
         _spawn_loop("market", _market_work,
-                    lambda: settings_store.get().market_interval, 40)
+                    lambda: settings_store.get().market_interval, 120)
         _spawn_loop("candle", _candle_work,
-                    lambda: settings_store.get().candle_interval, 60)
+                    lambda: settings_store.get().candle_interval, 90)
         _spawn_loop("news", _news_work,
                     lambda: settings_store.get().news_interval, 60)
         _spawn_loop("calendar", _calendar_work,

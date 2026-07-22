@@ -19,7 +19,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from . import db
 from .config import CONFIG
 from .connectors import (BaseExchangeConnector, DemoConnector, ReferenceConnector,
-                         build_connectors, maybe_recycle_client)
+                         RateLimited, UnsupportedPair, build_connectors,
+                         force_recycle_client, is_rate_limited, maybe_recycle_client,
+                         MAX_INFLIGHT)
 from .metrics import metrics_engine
 from .models import MarketSnapshot, MarketStatus, OrderBook, TickerStats
 from .settings import settings_store
@@ -28,6 +30,28 @@ from .volume_estimator import volume_estimator
 log = logging.getLogger("terminal.aggregator")
 
 STALE_AFTER_MS = 15_000
+# Keep last-good quote as "delayed" for this long before flipping to offline.
+SOFT_FAIL_GRACE_SEC = 90.0
+# Cap concurrent venue fetches so we never oversubscribe the httpx pool.
+# Global + per-exchange limits prevent one slow venue from starving the rest.
+_GLOBAL_SEM: Optional[asyncio.Semaphore] = None
+_EX_SEMS: Dict[str, asyncio.Semaphore] = {}
+PER_EXCHANGE_INFLIGHT = 4
+
+
+def _global_sem() -> asyncio.Semaphore:
+    global _GLOBAL_SEM
+    if _GLOBAL_SEM is None:
+        _GLOBAL_SEM = asyncio.Semaphore(MAX_INFLIGHT)
+    return _GLOBAL_SEM
+
+
+def _ex_sem(name: str) -> asyncio.Semaphore:
+    sem = _EX_SEMS.get(name)
+    if sem is None:
+        sem = asyncio.Semaphore(PER_EXCHANGE_INFLIGHT)
+        _EX_SEMS[name] = sem
+    return sem
 
 
 class MarketAggregator:
@@ -67,19 +91,37 @@ class MarketAggregator:
 
     # -------------------------------------------------------------- cycle --
     async def update_markets(self) -> None:
-        maybe_recycle_client()   # shed any leaked pooled connections between cycles
+        maybe_recycle_client()   # shed leaks if client aged out
         settings = settings_store.get()
         pairs = self.pairs()
-        refresh_stats = time.time() - self.last_stats_refresh > 60
+        # Stats/trades are expensive (extra RTT per pair). Refresh at most a
+        # rotating subset each minute so we never double the concurrent load.
+        refresh_stats = time.time() - self.last_stats_refresh > 90
+        stats_budget = 8
+        stats_allowed: set = set()
+        if refresh_stats:
+            self.last_stats_refresh = time.time()
+            all_keys = [(c.exchange_name, b)
+                        for c in self.connectors for b, _q in pairs
+                        if c.supports_pair(b)]
+            if all_keys:
+                start = (self.cycle_count * stats_budget) % len(all_keys)
+                for i in range(stats_budget):
+                    stats_allowed.add(all_keys[(start + i) % len(all_keys)])
+
         tasks = [
-            self._process(connector, base, quote, settings.request_timeout, refresh_stats)
+            self._process(connector, base, quote, settings.request_timeout,
+                          refresh_stats=(connector.exchange_name, base) in stats_allowed)
             for connector in self.connectors
             for base, quote in pairs
         ]
-        if refresh_stats:
-            self.last_stats_refresh = time.time()
         tasks.append(self._refresh_reference())
-        await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            # Always rebuild the shared client after a cycle so cancelled
+            # wait_for requests cannot leak sockets into the next wave.
+            force_recycle_client()
 
         self._compute_composites(pairs)
         self.cycle_count += 1
@@ -93,42 +135,54 @@ class MarketAggregator:
     async def _process(self, connector: BaseExchangeConnector, base: str, quote: str,
                        timeout: float, refresh_stats: bool) -> None:
         key = (connector.exchange_name, base)
+
+        # Skip known-unsupported pairs and rate-limited venues cheaply.
+        if not connector.supports_pair(base):
+            self._mark_unsupported(key, connector.exchange_name, base, quote)
+            return
+        if is_rate_limited(connector.exchange_name):
+            self._soft_fail(key, connector.exchange_name, base, quote,
+                            RateLimited(f"{connector.exchange_name} cooldown"))
+            return
+
         started = time.time()
         try:
-            book = await asyncio.wait_for(connector.fetch_order_book(base), timeout=timeout)
-            latency_ms = (time.time() - started) * 1000
-            if refresh_stats:
-                try:
-                    stats_result = await asyncio.wait_for(
-                        connector.fetch_stats(base), timeout=timeout)
-                    self.stats_cache[key] = stats_result
-                    if (not stats_result.volume_24h_base
-                            and not stats_result.volume_24h_quote
-                            and key not in self._vol_warned):
-                        self._vol_warned.add(key)
-                        if getattr(connector, "supports_trades", False):
-                            log.info("%s reports no 24h volume for %s — building"
-                                     " an estimate from the public trade tape",
-                                     connector.exchange_name, base)
-                        else:
-                            log.warning("%s reports no 24h volume for %s and has"
-                                        " no trades endpoint — share will read 0",
-                                        connector.exchange_name, base)
-                except Exception:
-                    pass
-                # trade-tape fallback: accumulate observed trades into the
-                # rolling 24h estimator for venues without reported volume
-                cached = self.stats_cache.get(key, TickerStats())
-                if (getattr(connector, "supports_trades", False)
-                        and not cached.volume_24h_base
-                        and not cached.volume_24h_quote):
-                    try:
-                        trades = await asyncio.wait_for(
-                            connector.fetch_trades(base), timeout=timeout)
-                        volume_estimator.ingest(connector.exchange_name, base, trades)
-                    except Exception as exc:
-                        log.debug("%s trades fetch failed: %s",
-                                  connector.exchange_name, exc)
+            async with _global_sem():
+                async with _ex_sem(connector.exchange_name):
+                    book = await asyncio.wait_for(
+                        connector.fetch_order_book(base), timeout=timeout)
+                    latency_ms = (time.time() - started) * 1000
+                    if refresh_stats:
+                        try:
+                            stats_result = await asyncio.wait_for(
+                                connector.fetch_stats(base), timeout=timeout)
+                            self.stats_cache[key] = stats_result
+                            if (not stats_result.volume_24h_base
+                                    and not stats_result.volume_24h_quote
+                                    and key not in self._vol_warned):
+                                self._vol_warned.add(key)
+                                if getattr(connector, "supports_trades", False):
+                                    log.info("%s reports no 24h volume for %s — building"
+                                             " an estimate from the public trade tape",
+                                             connector.exchange_name, base)
+                                else:
+                                    log.warning("%s reports no 24h volume for %s and has"
+                                                " no trades endpoint — share will read 0",
+                                                connector.exchange_name, base)
+                        except Exception:
+                            pass
+                        cached = self.stats_cache.get(key, TickerStats())
+                        if (getattr(connector, "supports_trades", False)
+                                and not cached.volume_24h_base
+                                and not cached.volume_24h_quote):
+                            try:
+                                trades = await asyncio.wait_for(
+                                    connector.fetch_trades(base), timeout=timeout)
+                                volume_estimator.ingest(
+                                    connector.exchange_name, base, trades)
+                            except Exception as exc:
+                                log.debug("%s trades fetch failed: %s",
+                                          connector.exchange_name, exc)
             stats = self.stats_cache.get(key, TickerStats())
             vol_estimated = False
             if not stats.volume_24h_base and not stats.volume_24h_quote:
@@ -167,25 +221,48 @@ class MarketAggregator:
             self.books[key] = book
             self.market_state[key] = snap
             metrics_engine.ingest(snap)
+        except UnsupportedPair:
+            self._mark_unsupported(key, connector.exchange_name, base, quote)
         except Exception as exc:
-            # surface feed failures in the in-app logs (throttled: once per
-            # venue+asset per 5 minutes) — this is how geo-blocks show up
-            now_warn = time.time()
-            if now_warn - self._fetch_warned.get(key, 0) > 300:
-                self._fetch_warned[key] = now_warn
-                log.warning("%s %s order-book fetch FAILED: %s: %s "
-                            "(run Admin → connectivity test)",
-                            connector.exchange_name, base,
-                            type(exc).__name__, str(exc)[:200])
-            else:
-                log.debug("%s %s fetch failed: %s", connector.exchange_name, base, exc)
-            prev = self.market_state.get(key)
-            if prev:
-                prev.status = MarketStatus.OFFLINE.value
-            else:
-                self.market_state[key] = MarketSnapshot(
-                    exchange=connector.exchange_name, base=base, quote=quote,
-                    status=MarketStatus.OFFLINE.value, timestamp=0.0)
+            self._soft_fail(key, connector.exchange_name, base, quote, exc)
+
+    def _mark_unsupported(self, key: Tuple[str, str], exchange: str,
+                          base: str, quote: str) -> None:
+        """Pair not listed on venue — quiet offline, no log spam."""
+        prev = self.market_state.get(key)
+        if prev and prev.mid > 0:
+            prev.status = MarketStatus.OFFLINE.value
+            return
+        self.market_state[key] = MarketSnapshot(
+            exchange=exchange, base=base, quote=quote,
+            status=MarketStatus.OFFLINE.value, timestamp=0.0)
+
+    def _soft_fail(self, key: Tuple[str, str], exchange: str,
+                   base: str, quote: str, exc: Exception) -> None:
+        """On transient errors keep last-good mid as delayed for a grace window
+        so the Admin board does not flap red every failed cycle."""
+        now_warn = time.time()
+        # RateLimited / timeouts: log less often; Unsupported already quiet
+        throttle = 120 if isinstance(exc, (RateLimited, asyncio.TimeoutError,
+                                           TimeoutError)) else 300
+        if now_warn - self._fetch_warned.get(key, 0) > throttle:
+            self._fetch_warned[key] = now_warn
+            log.warning("%s %s order-book fetch FAILED: %s: %s "
+                        "(run Admin → connectivity test)",
+                        exchange, base, type(exc).__name__, str(exc)[:200])
+        else:
+            log.debug("%s %s fetch failed: %s", exchange, base, exc)
+
+        prev = self.market_state.get(key)
+        if prev and prev.mid > 0:
+            age = now_warn - (prev.timestamp or 0.0)
+            prev.status = (MarketStatus.DELAYED.value
+                           if age < SOFT_FAIL_GRACE_SEC
+                           else MarketStatus.OFFLINE.value)
+        else:
+            self.market_state[key] = MarketSnapshot(
+                exchange=exchange, base=base, quote=quote,
+                status=MarketStatus.OFFLINE.value, timestamp=0.0)
 
     async def _refresh_reference(self) -> None:
         if not CONFIG.get("reference", {}).get("enabled", True):

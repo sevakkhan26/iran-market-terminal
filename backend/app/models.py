@@ -145,12 +145,12 @@ class Anomaly:
 
 @dataclass
 class AppSettings:
-    market_interval: float = 3.0        # seconds between polling cycles
+    market_interval: float = 15.0       # seconds between polling cycles
     snapshot_interval: float = 300.0    # seconds between DB snapshot writes
     candle_interval: float = 300.0      # seconds between candle refreshes
     news_interval: float = 600.0
     calendar_interval: float = 900.0
-    request_timeout: float = 6.0
+    request_timeout: float = 12.0       # per-request budget (connect+read)
     ui_refresh_interval: float = 5.0
     arb_min_edge_pct: float = 0.1       # opportunity-ledger entry threshold (net %)
 
@@ -160,7 +160,7 @@ class AppSettings:
         "candle_interval": (60.0, 3600.0),
         "news_interval": (60.0, 3600.0),
         "calendar_interval": (120.0, 3600.0),
-        "request_timeout": (1.0, 20.0),
+        "request_timeout": (1.0, 30.0),
         "ui_refresh_interval": (2.0, 120.0),
         "arb_min_edge_pct": (0.01, 5.0),
     }

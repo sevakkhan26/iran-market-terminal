@@ -30,44 +30,85 @@ HEADERS = {
     "Accept": "application/json",
 }
 
-# Bounded pool + a hard cap on the client's lifetime. On a server with a
-# flaky/slow route to the exchanges, every request that asyncio.wait_for cancels
-# on timeout can leak a pooled connection; with httpx's default (unbounded-ish)
-# pool that leak accumulates until the pool is exhausted and *every* subsequent
-# request stalls waiting for a free slot — the exact "works on my PC, dies after
-# ~10 min on the server, nothing in the logs" failure. We cap the pool AND
-# recycle the whole client every few minutes so any leak is periodically shed.
-_LIMITS = httpx.Limits(max_connections=40, max_keepalive_connections=10,
-                       keepalive_expiry=30.0)
-_CLIENT_MAX_AGE = 300.0        # rebuild the shared client every 5 minutes
+# Bounded pool + aggressive client recycle.
+#
+# Failure mode we hit in production (18 assets × 6 venues = 108 concurrent
+# fetches): asyncio.wait_for cancels leave pooled connections "in use", the
+# pool fills, and every subsequent request stalls → TimeoutError cascade and
+# Admin chips go red after a few minutes. Fix is three-part:
+#   1. Cap the pool well above the aggregator semaphore (see MAX_INFLIGHT).
+#   2. Split timeouts so a slow pool acquire does not burn the whole budget.
+#   3. Recycle the shared client every cycle (and at least every 60s) so leaks
+#      cannot accumulate across minutes.
+MAX_INFLIGHT = 20               # must match aggregator global semaphore
+_LIMITS = httpx.Limits(max_connections=max(60, MAX_INFLIGHT * 3),
+                       max_keepalive_connections=20,
+                       keepalive_expiry=20.0)
+_CLIENT_MAX_AGE = 60.0          # hard ceiling even if cycle recycle is skipped
 
 _client: Optional[httpx.AsyncClient] = None
 _client_ts: float = 0.0
+_client_timeout: float = 12.0
+
+# Shared rate-limit cooldowns: exchange_name -> unix ts until which we skip
+_rate_limited_until: Dict[str, float] = {}
 
 
-def get_client(timeout: float = 6.0) -> httpx.AsyncClient:
-    global _client, _client_ts
-    if _client is None or _client.is_closed:
-        _client = httpx.AsyncClient(timeout=httpx.Timeout(timeout), headers=HEADERS,
+class UnsupportedPair(ValueError):
+    """Pair is not listed on this venue — not a network failure."""
+
+
+class RateLimited(RuntimeError):
+    """Venue returned 429; caller should soft-fail without thrashing."""
+
+
+def get_client(timeout: float = 12.0) -> httpx.AsyncClient:
+    global _client, _client_ts, _client_timeout
+    # Rebuild if closed OR if the caller's timeout budget changed meaningfully
+    if (_client is None or _client.is_closed
+            or abs(timeout - _client_timeout) >= 1.0):
+        if _client is not None and not _client.is_closed:
+            try:
+                asyncio.get_running_loop().create_task(_aclose_later(_client, 2.0))
+            except RuntimeError:
+                pass
+        # connect/pool short; read gets the full request budget
+        t = httpx.Timeout(connect=5.0, read=timeout, write=10.0, pool=8.0)
+        _client = httpx.AsyncClient(timeout=t, headers=HEADERS,
                                     follow_redirects=True, limits=_LIMITS)
         _client_ts = time.time()
+        _client_timeout = timeout
     return _client
 
 
-def maybe_recycle_client() -> None:
-    """Drop and rebuild the shared client once it ages out, releasing any
-    connections leaked by cancelled requests. Call BETWEEN cycles only — never
-    while requests on the current client are still in flight in this task."""
+def maybe_recycle_client(force: bool = False) -> None:
+    """Drop and rebuild the shared client. Call BETWEEN cycles only — never
+    while requests on the current client are still in flight."""
     global _client, _client_ts
     if _client is None or _client.is_closed:
         return
-    if time.time() - _client_ts <= _CLIENT_MAX_AGE:
+    if not force and time.time() - _client_ts <= _CLIENT_MAX_AGE:
         return
-    old, _client = _client, None           # next get_client() builds a fresh one
+    old, _client = _client, None
     try:
-        asyncio.get_running_loop().create_task(_aclose_later(old))
+        asyncio.get_running_loop().create_task(_aclose_later(old, 5.0))
     except RuntimeError:
         pass
+
+
+def force_recycle_client() -> None:
+    """Always rebuild after a poll cycle to shed cancelled-request leaks."""
+    maybe_recycle_client(force=True)
+
+
+def is_rate_limited(exchange: str) -> bool:
+    until = _rate_limited_until.get(exchange, 0.0)
+    return time.time() < until
+
+
+def mark_rate_limited(exchange: str, seconds: float = 45.0) -> None:
+    _rate_limited_until[exchange] = time.time() + max(5.0, seconds)
+    log.warning("%s rate-limited — cooling down %.0fs", exchange, seconds)
 
 
 async def _aclose_later(client: httpx.AsyncClient, delay: float = 10.0) -> None:
@@ -84,6 +125,19 @@ async def close_client() -> None:
         await _client.aclose()
     _client = None
 
+
+async def request_get(url: str, *, exchange: str = "",
+                      timeout: Optional[float] = None, **kwargs) -> httpx.Response:
+    """GET with 429 → RateLimited. Prefer this for venue calls that rate-limit."""
+    if exchange and is_rate_limited(exchange):
+        raise RateLimited(f"{exchange} in cooldown")
+    client = get_client(timeout if timeout is not None else _client_timeout)
+    r = await client.get(url, **kwargs)
+    if r.status_code == 429:
+        if exchange:
+            mark_rate_limited(exchange, 60.0)
+        raise RateLimited(f"{exchange or url}: HTTP 429")
+    return r
 
 def first_positive(item: Dict[str, Any], keys: tuple) -> float:
     """Scan a payload dict for the first positive numeric value among keys.
@@ -180,6 +234,11 @@ class BaseExchangeConnector:
 
     def __init__(self, depth_levels: int = 20) -> None:
         self.depth_levels = depth_levels
+
+    def supports_pair(self, base: str) -> bool:
+        """Return False for known-unsupported pairs so the aggregator skips
+        them without burning concurrency or spamming error logs."""
+        return True
 
     # -- required ------------------------------------------------------------
     async def fetch_order_book(self, base: str) -> OrderBook:
@@ -403,13 +462,24 @@ class ExirConnector(BaseExchangeConnector):
     exchange_name = "Exir"
     supports_candles = True
     BASE_URL = "https://api.exir.io"
+    # Exir rate-limits aggressively when hit with 18 pairs every cycle.
+    # Only poll majors here; the rest thrash into 429 and poison the pool.
+    SUPPORTED = {"BTC", "ETH", "USDT", "TRX", "SOL", "BNB", "XRP", "ADA"}
 
     def _symbol(self, base: str) -> str:
         return f"{base.lower()}-irt"
 
+    def supports_pair(self, base: str) -> bool:
+        return base.upper() in self.SUPPORTED
+
     async def fetch_order_book(self, base: str) -> OrderBook:
+        if not self.supports_pair(base):
+            raise UnsupportedPair(f"Exir: pair not polled for {base}")
+        if is_rate_limited(self.exchange_name):
+            raise RateLimited("Exir in cooldown")
         sym = self._symbol(base)
-        r = await get_client().get(f"{self.BASE_URL}/v2/orderbook", params={"symbol": sym})
+        r = await request_get(f"{self.BASE_URL}/v2/orderbook",
+                              exchange=self.exchange_name, params={"symbol": sym})
         r.raise_for_status()
         book = r.json().get(sym, {})
         bids = _normalize_levels(book.get("bids"), descending=True)
@@ -417,8 +487,11 @@ class ExirConnector(BaseExchangeConnector):
         return self._book(bids, asks)
 
     async def fetch_stats(self, base: str) -> TickerStats:
-        r = await get_client().get(f"{self.BASE_URL}/v2/ticker",
-                                   params={"symbol": self._symbol(base)})
+        if not self.supports_pair(base) or is_rate_limited(self.exchange_name):
+            return TickerStats()
+        r = await request_get(f"{self.BASE_URL}/v2/ticker",
+                              exchange=self.exchange_name,
+                              params={"symbol": self._symbol(base)})
         r.raise_for_status()
         d = r.json()
         return TickerStats(
@@ -523,7 +596,12 @@ class RamzinexConnector(BaseExchangeConnector):
     BASE_URL = "https://publicapi.ramzinex.com"
     RIAL_SCALE = 0.1
     # Ramzinex identifies markets by numeric pair id (IRR-quoted).
+    # Only these three are known stable public IDs — other assets must not be
+    # polled (they raise UnsupportedPair and used to spam the error log).
     PAIR_IDS: Dict[str, int] = {"BTC": 2, "ETH": 3, "USDT": 11}
+
+    def supports_pair(self, base: str) -> bool:
+        return base.upper() in self.PAIR_IDS
 
     async def fetch_trades(self, base: str) -> List[Dict[str, Any]]:
         pair_id = self.PAIR_IDS.get(base.upper())
@@ -539,7 +617,7 @@ class RamzinexConnector(BaseExchangeConnector):
     async def fetch_order_book(self, base: str) -> OrderBook:
         pair_id = self.PAIR_IDS.get(base.upper())
         if pair_id is None:
-            raise ValueError(f"Ramzinex: unknown pair for {base}")
+            raise UnsupportedPair(f"Ramzinex: unknown pair for {base}")
         r = await get_client().get(
             f"{self.BASE_URL}/exchange/api/v1.0/exchange/orderbooks/{pair_id}/buys_sells")
         r.raise_for_status()
