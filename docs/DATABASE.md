@@ -2,7 +2,7 @@
 
 ## Why Postgres
 
-v3 stores **all** runtime state in PostgreSQL:
+v3+ stores **all** runtime state in PostgreSQL (stable production path):
 
 | Data | Table(s) |
 |------|----------|

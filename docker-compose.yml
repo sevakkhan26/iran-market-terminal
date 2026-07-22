@@ -37,6 +37,8 @@ services:
   terminal:
     build:
       context: .
+      # Host network during build so pip/npm resolve DNS on flaky Docker setups
+      network: host
       args:
         GIT_SHA: "${GIT_SHA:-unknown}"
     image: iran-market-terminal:latest
@@ -45,6 +47,12 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # Explicit DNS — same pattern that fixed IR exchange connectivity
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+      - 9.9.9.9
+      - 178.22.122.100
     ports:
       - "${PORT:-4000}:4000"
     environment:
@@ -64,6 +72,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-terminal}
       POSTGRES_DB: ${POSTGRES_DB:-terminal}
       DATABASE_URL: postgresql://${POSTGRES_USER:-terminal}:${POSTGRES_PASSWORD:-terminal}@db:5432/${POSTGRES_DB:-terminal}
+      PG_POOL_MAX: "${PG_POOL_MAX:-16}"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4000/api/health', timeout=6).status==200 else 1)"]
       interval: 30s

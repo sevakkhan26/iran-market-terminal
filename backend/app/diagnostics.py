@@ -172,7 +172,16 @@ def environment_report(aggregator, news_service) -> Dict[str, Any]:
                 v["exchange"], v["base"],
             ),
         ),
+        "circuits": _circuit_snapshot(),
     }
+
+
+def _circuit_snapshot() -> Dict[str, Any]:
+    try:
+        from .circuit_breaker import breakers
+        return breakers.snapshot()
+    except Exception:
+        return {}
 
 
 # -------------------------------------------------------- connectivity test

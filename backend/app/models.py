@@ -145,8 +145,8 @@ class Anomaly:
 
 @dataclass
 class AppSettings:
-    market_interval: float = 15.0       # seconds between polling cycles
-    snapshot_interval: float = 300.0    # seconds between DB snapshot writes
+    market_interval: float = 20.0       # seconds between polling cycles
+    snapshot_interval: float = 120.0    # seconds between DB snapshot writes
     candle_interval: float = 300.0      # seconds between candle refreshes
     news_interval: float = 600.0
     calendar_interval: float = 900.0

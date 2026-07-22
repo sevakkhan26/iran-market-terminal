@@ -59,7 +59,8 @@ operators use it to confirm which build is running.
   `alembic upgrade head` on boot).
 - Server deploy: same compose file; collector must stay enabled (`RUN_COLLECTOR=1`).
 - Do not reintroduce unbounded concurrent exchange fetches (see `MAX_INFLIGHT`
-  in `backend/app/connectors.py`).
+  in `backend/app/connectors.py` and circuit breakers in `circuit_breaker.py`).
+- Prefer `docker compose up -d --build` after pull; migrations auto-run.
 
 ## Rule of thumb
 

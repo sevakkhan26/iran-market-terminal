@@ -59,42 +59,92 @@ _pool: Optional[ConnectionPool] = None
 _pool_lock = threading.Lock()
 
 
+def _pool_is_open(pool: Optional[ConnectionPool]) -> bool:
+    if pool is None:
+        return False
+    try:
+        return not bool(getattr(pool, "closed", False))
+    except Exception:
+        return False
+
+
 def _get_pool() -> ConnectionPool:
     global _pool
-    if _pool is not None:
-        return _pool
+    if _pool_is_open(_pool):
+        return _pool  # type: ignore[return-value]
     with _pool_lock:
-        if _pool is None:
-            url = database_url()
-            log.info("Opening Postgres pool → %s", database_info())
-            _pool = ConnectionPool(
-                conninfo=url,
-                min_size=1,
-                max_size=int(os.environ.get("PG_POOL_MAX", "12")),
-                kwargs={"row_factory": dict_row, "autocommit": False},
-                open=True,
-                timeout=30.0,
-            )
+        if _pool_is_open(_pool):
+            return _pool  # type: ignore[return-value]
+        if _pool is not None:
+            try:
+                _pool.close()
+            except Exception:
+                pass
+            _pool = None
+        url = database_url()
+        log.info("Opening Postgres pool → %s", database_info())
+        # kwargs vary slightly across psycopg_pool versions — keep core options only
+        _pool = ConnectionPool(
+            conninfo=url,
+            min_size=2,
+            max_size=int(os.environ.get("PG_POOL_MAX", "16")),
+            kwargs={"row_factory": dict_row, "autocommit": False},
+            open=True,
+            timeout=30.0,
+        )
     return _pool
 
 
 @contextmanager
 def _cursor(commit: bool = False):
-    """Yield a dict-row cursor; commit on success when commit=True."""
-    pool = _get_pool()
-    with pool.connection() as conn:
-        with conn.cursor() as cur:
-            try:
-                yield cur
-                if commit:
-                    conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+    """Yield a dict-row cursor; commit on success when commit=True.
+    One automatic reconnect attempt if the pool connection is dead."""
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            pool = _get_pool()
+            with pool.connection() as conn:
+                with conn.cursor() as cur:
+                    try:
+                        yield cur
+                        if commit:
+                            conn.commit()
+                        return
+                    except Exception:
+                        conn.rollback()
+                        raise
+        except Exception as exc:
+            last_exc = exc
+            log.warning("DB cursor failed (attempt %d): %s", attempt + 1, exc)
+            # force pool rebuild on next try
+            close_pool()
+            if attempt == 0:
+                time.sleep(0.3)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
 
 
-def ensure_schema() -> None:
-    """Run Alembic migrations to head. Safe to call on every process start."""
+def wait_for_db(timeout_sec: float = 60.0) -> None:
+    """Block until Postgres accepts connections (used by entrypoint + lifespan)."""
+    import psycopg
+    url = database_url()
+    deadline = time.time() + timeout_sec
+    last: Exception | None = None
+    while time.time() < deadline:
+        try:
+            with psycopg.connect(url, connect_timeout=3) as conn:
+                conn.execute("SELECT 1")
+            return
+        except Exception as exc:
+            last = exc
+            time.sleep(1.0)
+    raise RuntimeError(f"Postgres not ready after {timeout_sec:.0f}s: {last}")
+
+
+def ensure_schema(retries: int = 5) -> None:
+    """Run Alembic migrations to head. Retries if Postgres is still warming up."""
     from alembic import command
     from alembic.config import Config
     from pathlib import Path
@@ -105,10 +155,24 @@ def ensure_schema() -> None:
         raise RuntimeError(f"alembic.ini not found at {ini}")
     cfg = Config(str(ini))
     cfg.set_main_option("script_location", str(backend_root / "alembic"))
-    # env.py reads DATABASE_URL / POSTGRES_* itself
-    log.info("Running database migrations (alembic upgrade head)…")
-    command.upgrade(cfg, "head")
-    log.info("Database schema is up to date")
+
+    last: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            wait_for_db(timeout_sec=30.0 if attempt == 1 else 15.0)
+            log.info("Running database migrations (attempt %d)…", attempt)
+            command.upgrade(cfg, "head")
+            log.info("Database schema is up to date")
+            # warm the pool
+            with _cursor() as cur:
+                cur.execute("SELECT 1")
+            return
+        except Exception as exc:
+            last = exc
+            log.warning("Migration attempt %d failed: %s", attempt, exc)
+            close_pool()
+            time.sleep(min(2.0 * attempt, 8.0))
+    raise RuntimeError(f"Database migration failed after {retries} attempts: {last}")
 
 
 def close_pool() -> None:

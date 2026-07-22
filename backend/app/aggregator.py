@@ -1,12 +1,11 @@
 """Market aggregator: polls all connectors, computes metrics, persists snapshots.
 
 Cycle (every `market_interval` seconds):
-  1. Fan out order-book fetches for every connector x pair (asyncio.gather).
-  2. Ticker stats refreshed on a slower cadence (every 60s).
-  3. Build MarketSnapshot per exchange x pair; feed the metrics engine.
-  4. Compute composite (cross-exchange) mid + Iran premium per pair.
-  5. Every `snapshot_interval` (default 5 min): batch-write snapshots to SQLite.
-  6. Run anomaly detection + alert rules; broadcast state to WebSocket clients.
+  1. Bounded fan-out of order-book fetches (global + per-venue semaphores).
+  2. Skip circuit-open / rate-limited / unsupported venue×pair slots.
+  3. Build MarketSnapshot per live feed; soft-fail keeps last-good as delayed.
+  4. Composite mid + Iran premium; batch-write snapshots to PostgreSQL.
+  5. Recycle the shared HTTP client after every cycle (leak shed).
 """
 from __future__ import annotations
 
@@ -17,6 +16,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import db
+from .circuit_breaker import breakers
 from .config import CONFIG
 from .connectors import (BaseExchangeConnector, DemoConnector, ReferenceConnector,
                          RateLimited, UnsupportedPair, build_connectors,
@@ -31,16 +31,17 @@ log = logging.getLogger("terminal.aggregator")
 
 STALE_AFTER_MS = 15_000
 # Keep last-good quote as "delayed" for this long before flipping to offline.
-SOFT_FAIL_GRACE_SEC = 90.0
+SOFT_FAIL_GRACE_SEC = 120.0
 # Cap concurrent venue fetches so we never oversubscribe the httpx pool.
-# Global + per-exchange limits prevent one slow venue from starving the rest.
 _GLOBAL_SEM: Optional[asyncio.Semaphore] = None
 _EX_SEMS: Dict[str, asyncio.Semaphore] = {}
-PER_EXCHANGE_INFLIGHT = 4
+PER_EXCHANGE_INFLIGHT = 3
 # Venues that 429 or time out under parallelism get a tighter slot budget.
 EXCHANGE_INFLIGHT = {
     "Exir": 1,
-    "Ramzinex": 2,
+    "Ramzinex": 1,
+    "Bitpin": 2,
+    "Tabdeal": 2,
 }
 
 
@@ -123,11 +124,13 @@ class MarketAggregator:
                 for i in range(stats_budget):
                     stats_allowed.add(all_keys[(start + i) % len(all_keys)])
 
+        t0 = time.time()
         tasks = [
             self._process(connector, base, quote, settings.request_timeout,
                           refresh_stats=(connector.exchange_name, base) in stats_allowed)
             for connector in self.connectors
             for base, quote in pairs
+            if connector.supports_pair(base)  # never schedule unsupported slots
         ]
         tasks.append(self._refresh_reference())
         try:
@@ -139,25 +142,40 @@ class MarketAggregator:
 
         self._compute_composites(pairs)
         self.cycle_count += 1
+        elapsed = time.time() - t0
+        live = sum(1 for s in self.market_state.values()
+                   if s.mid > 0 and s.status != MarketStatus.OFFLINE.value)
+        if self.cycle_count % 5 == 1 or elapsed > 25:
+            log.info("market cycle #%d done in %.1fs — live_feeds=%d/%d open_circuits=%s",
+                     self.cycle_count, elapsed, live, len(self.market_state),
+                     [k for k, v in breakers.snapshot().items() if v["state"] == "open"])
 
         if time.time() - self.last_snapshot_write >= settings.snapshot_interval:
-            await asyncio.to_thread(self._persist_snapshots, pairs)
-            self.last_snapshot_write = time.time()
+            try:
+                await asyncio.to_thread(self._persist_snapshots, pairs)
+                self.last_snapshot_write = time.time()
+            except Exception as exc:
+                log.error("snapshot persist failed (will retry next cycle): %s", exc)
 
         self._broadcast()
 
     async def _process(self, connector: BaseExchangeConnector, base: str, quote: str,
                        timeout: float, refresh_stats: bool) -> None:
         key = (connector.exchange_name, base)
+        ex = connector.exchange_name
 
         # Skip known-unsupported pairs — do NOT leave offline chips in Admin.
         if not connector.supports_pair(base):
             self.market_state.pop(key, None)
             self.books.pop(key, None)
             return
-        if is_rate_limited(connector.exchange_name):
-            self._soft_fail(key, connector.exchange_name, base, quote,
-                            RateLimited(f"{connector.exchange_name} cooldown"))
+        if not breakers.allow(ex):
+            self._soft_fail(key, ex, base, quote,
+                            RateLimited(f"{ex} circuit open"))
+            return
+        if is_rate_limited(ex):
+            self._soft_fail(key, ex, base, quote,
+                            RateLimited(f"{ex} cooldown"))
             return
 
         # Slow venues get a longer wait_for budget (retries live in the connector).
@@ -243,11 +261,13 @@ class MarketAggregator:
             self.books[key] = book
             self.market_state[key] = snap
             metrics_engine.ingest(snap)
+            breakers.record_success(ex)
         except UnsupportedPair:
             self.market_state.pop(key, None)
             self.books.pop(key, None)
         except Exception as exc:
-            self._soft_fail(key, connector.exchange_name, base, quote, exc)
+            breakers.record_failure(ex, f"{type(exc).__name__}: {exc}")
+            self._soft_fail(key, ex, base, quote, exc)
 
     def _soft_fail(self, key: Tuple[str, str], exchange: str,
                    base: str, quote: str, exc: Exception) -> None:

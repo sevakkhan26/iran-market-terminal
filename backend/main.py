@@ -109,7 +109,7 @@ _loop_tasks: Dict[str, asyncio.Task] = {}
 _shutting_down = False
 _STARTED_AT = time.time()
 
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 
 
 def _resolve_build_info() -> Dict[str, str]:
