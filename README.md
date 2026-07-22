@@ -43,7 +43,7 @@ Default DB credentials (change in `.env` for real use):
 | `POSTGRES_USER` | `terminal` |
 | `POSTGRES_PASSWORD` | `terminal` |
 | `POSTGRES_DB` | `terminal` |
-| `POSTGRES_PORT` | `5432` (host) |
+| `POSTGRES_PORT` | `5433` (host; container still uses 5432) |
 
 **After every `git pull`:**
 

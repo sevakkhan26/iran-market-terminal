@@ -22,8 +22,9 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-terminal}
       POSTGRES_DB: ${POSTGRES_DB:-terminal}
     ports:
-      # Published for host-side tools / local `python main.py` without docker app
-      - "${POSTGRES_PORT:-5432}:5432"
+      # Host port (container always 5432). Default 5433 avoids clashing with
+      # another local Postgres (e.g. OTC desk on 5432).
+      - "${POSTGRES_PORT:-5433}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
